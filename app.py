@@ -28,7 +28,7 @@ if not OPENAI_API_KEY or not PINECONE_API_KEY:
 NAMESPACES = ["fiction", "nonfiction", "trading", "personal", "reference"]
 
 # ---------- Clients ----------
-oai = OpenAI(api_key=OPENAI_API_KEY)
+oai = OpenAI()  # picks up OPENAI_API_KEY from env
 pc  = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
 
