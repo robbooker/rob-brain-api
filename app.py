@@ -129,8 +129,9 @@ def search(body: SearchBody, _: bool = Depends(require_bearer)):
     flt = flt or None
 
     # 3) Which namespaces to hit?
-    ns_param = (body.namespace or "").strip().lower()
-    namespaces = NAMESPACES if (not ns_param or ns_param == "all") else [ns_param]
+   # Always search across all namespaces unless one is explicitly given
+ns_param = (body.namespace or "").strip().lower()
+namespaces = NAMESPACES if not ns_param else [ns_param]
 
     # 4) Query each namespace, slightly over-fetch, then merge + rerank
     per_ns_k = max(min(body.top_k, 12), 6)  # 6..12 per namespace
