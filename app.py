@@ -33,7 +33,13 @@ pc  = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
 
 # ---------- App ----------
-app = FastAPI(title="Rob Forever Brain API", version="2.0.0")
+app = FastAPI(
+    title="Rob Forever Brain API",
+    version="2.0.0",
+    servers=[
+        {"url": "https://rob-brain-api.onrender.com", "description": "Live server"}
+    ]
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
