@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Query
 from pydantic import BaseModel
 
 from openai import OpenAI
