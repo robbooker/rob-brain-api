@@ -414,3 +414,63 @@ def fees(body: FeesBody):
         },
         "pretty": "\n".join(pretty),
     }
+from datetime import datetime
+
+@app.post("/fees_summary")
+def fees_summary(
+    symbol: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    top_k: int = 200,
+    authorization: Optional[str] = Header(default=None)
+):
+    _check_bearer(authorization)
+
+    vec = embed_query(symbol + " borrow fee")
+    res = index.query(
+        vector=vec,
+        top_k=top_k,
+        namespace="trading",
+        include_metadata=True,
+    )
+
+    matches = getattr(res, "matches", []) or []
+    rows = []
+
+    total = 0.0
+    for m in matches:
+        md = m.metadata or {}
+        sym = (md.get("symbol") or "").upper()
+        amt = md.get("amount") or 0.0
+        date_str = md.get("date")
+
+        # Skip if not the same symbol
+        if sym != symbol.upper():
+            continue
+
+        # Filter by date range if provided
+        if start_date or end_date:
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if start_date and d < datetime.strptime(start_date, "%Y-%m-%d").date():
+                    continue
+                if end_date and d > datetime.strptime(end_date, "%Y-%m-%d").date():
+                    continue
+            except:
+                pass
+
+        total += amt
+        rows.append({
+            "date": date_str,
+            "amount": amt,
+            "description": md.get("description", ""),
+            "fee_type": md.get("fee_type", ""),
+            "score": m.score
+        })
+
+    return {
+        "symbol": symbol.upper(),
+        "total": total,
+        "count": len(rows),
+        "rows": rows
+    }
