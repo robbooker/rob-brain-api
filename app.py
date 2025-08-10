@@ -539,3 +539,93 @@ def fees_summary(
         resp["rows"] = rows
 
     return resp
+
+# =========================
+# /fees_rollup endpoint
+# =========================
+from fastapi import Query
+
+@app.post("/fees_rollup")
+def fees_rollup(
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
+    top_k: int                = Query(5000, description="How many rows to scan"),
+    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Roll up borrow-related fees by symbol for a date window.
+    Includes fee rows tagged as `borrow_fee` or `overnight_borrow_fee`.
+    Returns: { by_symbol: [{symbol, total}], grand_total }
+    """
+    _check_bearer(authorization)
+
+    # Parse date bounds (supports ISO 'YYYY-MM-DD' and US 'M/D/YYYY')
+    start_dt = _parse_any_date(start_date) if start_date else None
+    end_dt   = _parse_any_date(end_date)   if end_date   else None
+
+    def in_range(dstr: str) -> bool:
+        if not (start_dt or end_dt):
+            return True
+        d = _parse_any_date(dstr)
+        if not d:
+            return False
+        if start_dt and d < start_dt:
+            return False
+        if end_dt and d > end_dt:
+            return False
+        return True
+
+    ns = "trading"
+    # Neutral embedding to pull a wide net of fee rows
+    vec = embed_query("stock borrow fee overnight borrow fee trading summary")
+
+    res = index.query(
+        vector=vec,
+        top_k=top_k,
+        namespace=ns,
+        include_metadata=True,
+    )
+    matches = getattr(res, "matches", []) or []
+
+    per_symbol: Dict[str, float] = {}
+    grand_total = 0.0
+    rows_scanned = 0
+
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+        # Optional file filter
+        if file and str(md.get("file", "")).strip() != file.strip():
+            continue
+
+        ft = (md.get("fee_type") or "").lower()
+        if ft not in ("borrow_fee", "overnight_borrow_fee"):
+            continue
+
+        dstr = md.get("date") or ""
+        if not in_range(dstr):
+            continue
+
+        sym = str(md.get("symbol", "")).upper()
+        amt = float(md.get("amount") or 0.0)
+
+        per_symbol[sym] = per_symbol.get(sym, 0.0) + amt
+        grand_total += amt
+        rows_scanned += 1
+
+    # Sort by total ascending (most negative first, like your jq sort)
+    by_symbol = [{"symbol": s, "total": t} for s, t in per_symbol.items()]
+    by_symbol.sort(key=lambda x: x["total"])
+
+    return {
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "top_k": top_k,
+            "file": file,
+            "namespace": ns,
+            "rows_scanned": rows_scanned,
+        },
+        "by_symbol": by_symbol,
+        "grand_total": grand_total,
+    }
