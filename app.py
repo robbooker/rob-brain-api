@@ -553,9 +553,228 @@ def fees_summary(
     return resp
 
 # =========================
-# /fees_rollup endpoint
+# /short_pnl endpoint
 # =========================
-from fastapi import Query
+
+from typing import Optional, List, Dict, Any
+from fastapi import Query, Header
+
+@app.post("/short_pnl")
+def short_pnl(
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date:   Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    symbols:    Optional[List[str]] = Query(None, description="Optional list of symbols to include"),
+    file:       Optional[str] = Query(None, description="Optional CSV filename to restrict"),
+    top_k:      int = Query(5000, description="How many rows to scan"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Compute realized PnL from shorting within a date window by pairing
+    SELL (open) and BUY (cover) trades (FIFO).
+    Only rows with Type == 'Short' are considered.
+    """
+    _check_bearer(authorization)
+
+    # Parse date bounds
+    start_dt = _parse_any_date(start_date) if start_date else None
+    end_dt   = _parse_any_date(end_date)   if end_date   else None
+
+    def in_range(dstr: str) -> bool:
+        if not (start_dt or end_dt):
+            return True
+        d = _parse_any_date(dstr)
+        if not d:
+            return False
+        if start_dt and d < start_dt:
+            return False
+        if end_dt and d > end_dt:
+            return False
+        return True
+
+    def norm_sym(x: Any) -> str:
+        return str(x or "").upper().strip()
+
+    def norm_side(md: Dict[str, Any]) -> str:
+        # Accept "B/S", "side", "Side", etc.
+        for k in ("B/S", "BS", "side", "Side", "b_s"):
+            if k in md:
+                v = str(md[k]).strip().lower()
+                if v in ("buy", "sell"):
+                    return v
+        # Some CSVs use "Action"
+        v = str(md.get("Action") or "").strip().lower()
+        if v in ("buy", "sell"):
+            return v
+        return ""
+
+    def norm_type(md: Dict[str, Any]) -> str:
+        v = str(md.get("Type") or md.get("type") or "").strip().lower()
+        return v
+
+    def norm_date(md: Dict[str, Any]) -> str:
+        return str(md.get("date") or md.get("Date") or "")
+
+    def to_float(x: Any) -> float:
+        s = str(x or "").replace(",", "").strip()
+        if s in ("", "nan", "None", "null"):
+            return 0.0
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def get_qty(md: Dict[str, Any]) -> float:
+        for k in ("quantity", "Quantity", "qty", "Qty", "Shares"):
+            if k in md:
+                return to_float(md[k])
+        return 0.0
+
+    def get_price(md: Dict[str, Any]) -> float:
+        for k in ("price", "Price", "FillPrice", "AvgPrice", "avg_price"):
+            if k in md:
+                return to_float(md[k])
+        return 0.0
+
+    def get_symbol(md: Dict[str, Any]) -> str:
+        for k in ("symbol", "Symbol", "Ticker"):
+            if k in md:
+                return norm_sym(md[k])
+        return ""
+
+    ns = "trading"
+    # Broad vector to pull trade rows
+    vec = embed_query("short trade SELL BUY cover realized pnl fifo position matching")
+
+    res = index.query(
+        vector=vec,
+        top_k=top_k,
+        namespace=ns,
+        include_metadata=True,
+    )
+    matches = getattr(res, "matches", []) or []
+
+    # Optional filters
+    symbols_set = set(s.upper() for s in symbols) if symbols else None
+
+    # FIFO lots per symbol: list of dicts {shares_remaining, price}
+    lots: Dict[str, List[Dict[str, float]]] = {}
+    per_symbol: Dict[str, Dict[str, float]] = {}  # gross_proceeds, cover_cost, realized_pnl, shares_sold, shares_covered
+
+    rows_scanned = 0
+
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+
+        # file filter (if provided)
+        if file:
+            if str(md.get("file", "")).strip() != file.strip():
+                continue
+
+        # type must be "short"
+        if norm_type(md) != "short":
+            continue
+
+        # date window
+        dstr = norm_date(md)
+        if not in_range(dstr):
+            continue
+
+        sym = get_symbol(md)
+        if not sym:
+            continue
+        if symbols_set and sym not in symbols_set:
+            continue
+
+        side = norm_side(md)
+        if side not in ("sell", "buy"):
+            continue
+
+        qty = get_qty(md)
+        price = get_price(md)
+        # Normalize shares: use absolute size; sign in CSV may be neg for sells
+        shares = abs(qty)
+        if shares <= 0 or price <= 0:
+            continue
+
+        rows_scanned += 1
+        if sym not in per_symbol:
+            per_symbol[sym] = {
+                "gross_proceeds": 0.0,
+                "cover_cost": 0.0,
+                "realized_pnl": 0.0,
+                "shares_sold": 0.0,
+                "shares_covered": 0.0,
+            }
+        if sym not in lots:
+            lots[sym] = []
+
+        rec = per_symbol[sym]
+
+        if side == "sell":
+            # Opening short lot
+            lots[sym].append({"shares_remaining": shares, "price": price})
+            rec["gross_proceeds"] += shares * price
+            rec["shares_sold"] += shares
+        else:
+            # Cover: match FIFO against existing lots
+            remaining = shares
+            while remaining > 0 and lots[sym]:
+                lot = lots[sym][0]
+                take = min(remaining, lot["shares_remaining"])
+                sell_price = lot["price"]
+                buy_price = price
+                # For a short, pnl = (sell_price - buy_price) * shares
+                rec["realized_pnl"] += (sell_price - buy_price) * take
+                rec["cover_cost"] += buy_price * take
+
+                lot["shares_remaining"] -= take
+                remaining -= take
+
+                if lot["shares_remaining"] <= 1e-9:
+                    lots[sym].pop(0)
+
+            # If remaining > 0, that means we covered more than we had open;
+            # we count the buy cost for transparency but there's no matching lot
+            if remaining > 0:
+                rec["cover_cost"] += buy_price * remaining  # unmatched; rare
+            rec["shares_covered"] += shares
+
+    # Build response list
+    by_symbol = []
+    grand_gross = grand_cost = grand_pnl = 0.0
+    for sym, r in per_symbol.items():
+        by_symbol.append({
+            "symbol": sym,
+            "gross_proceeds": round(r["gross_proceeds"], 2),
+            "cover_cost": round(r["cover_cost"], 2),
+            "realized_pnl": round(r["realized_pnl"], 2),
+            "shares_sold": r["shares_sold"],
+            "shares_covered": r["shares_covered"],
+        })
+        grand_gross += r["gross_proceeds"]
+        grand_cost  += r["cover_cost"]
+        grand_pnl   += r["realized_pnl"]
+
+    # Sort by absolute realized PnL descending (nice to read)
+    by_symbol.sort(key=lambda x: abs(x["realized_pnl"]), reverse=True)
+
+    return {
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "symbols": list(symbols_set) if symbols_set else None,
+            "file": file,
+            "top_k": top_k,
+            "namespace": ns,
+        },
+        "rows_scanned": rows_scanned,
+        "by_symbol": by_symbol,
+        "grand_totals": {
+            "gross_proceeds": round(grand_gross, 2),
+            "cover_cost": round(grand_cost, 2),
+            "realized_pnl": round(grand_pnl, 2),
+        },
+    }
 
 # =========================
 # /fees_rollup endpoint
