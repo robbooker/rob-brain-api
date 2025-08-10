@@ -1,22 +1,108 @@
+# app.py
+# FastAPI app for Rob Brain API
+# Endpoints: /healthz, /search, /ask, /fees, /fees_summary, /fees_rollup, /short_pnl
+
 import os
+import math
+from datetime import datetime
+from typing import List, Dict, Optional, Any
 
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "120000"))  # ~120 KB
-MAX_EXCERPT_CHARS = int(os.getenv("MAX_EXCERPT_CHARS", "1500"))    # per hit
-
-import time
-import logging
-from typing import List, Optional, Dict, Any
-
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Query
-from pydantic import BaseModel
 
-# add near your other imports
-from typing import Optional, List
-from pydantic import BaseModel
+# ==== OpenAI embeddings ====
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# === Request body model for /fees ===
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
+# text-embedding-3-large has 3072 dims; -small has 1536
+EMBED_DIM = 3072 if "large" in EMBED_MODEL else 1536
+
+def embed_query(text: str) -> List[float]:
+    resp = client.embeddings.create(model=EMBED_MODEL, input=text)
+    return resp.data[0].embedding
+
+# ==== INDEX SETUP (swap for your existing one if different) ====
+# We expect a vector index client with .query(vector, top_k, namespace, include_metadata=True)
+# and optionally .describe_index_stats() for healthz. Replace with your known-good code if needed.
+from pinecone import Pinecone
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+INDEX_NAME = os.getenv("PINECONE_INDEX", "rob-brain")
+index = pc.Index(INDEX_NAME)
+
+# ==== FastAPI ====
+app = FastAPI(title="Rob Forever Brain API", version="2.2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
+
+# ==== Helpers ====
+def _check_bearer(authorization: Optional[str]) -> None:
+    want = os.getenv("API_BEARER", "H@173y8004er")
+    if not authorization:
+        raise ValueError("missing Authorization header")
+    if not authorization.lower().startswith("bearer "):
+        raise ValueError("expected Bearer token")
+    token = authorization.split(" ", 1)[1]
+    if token != want:
+        raise ValueError("invalid token")
+
+def _parse_any_date(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    s = str(s).strip()
+    # Try ISO first: YYYY-MM-DD
+    try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return datetime.strptime(s, "%Y-%m-%d")
+    except:
+        pass
+    # Try M/D/YYYY or MM/DD/YYYY
+    for fmt in ("%m/%d/%Y", "%-m/%-d/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except:
+            pass
+    # Try D/M/YYYY (rare)
+    for fmt in ("%d/%m/%Y",):
+        try:
+            return datetime.strptime(s, fmt)
+        except:
+            pass
+    return None
+
+def _safe_float(x, default=0.0) -> float:
+    try:
+        return float(str(x).replace(",", ""))
+    except:
+        return default
+
+def _md_get(md: Dict[str, Any], *keys, default=None):
+    for k in keys:
+        if k in md and md[k] not in (None, ""):
+            return md[k]
+    return default
+
+# ==== Models (pydantic lite via typing) ====
+from pydantic import BaseModel
+class SearchBody(BaseModel):
+    query: str
+    top_k: int = 8
+    namespace: Optional[str] = None
+    symbols: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+
+class AskBody(BaseModel):
+    question: str
+    top_k: int = 12
+    namespace: Optional[str] = None
+    min_score: Optional[float] = None
+    symbols: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+
 class FeesBody(BaseModel):
     file: Optional[str] = None
     namespace: str = "trading"
@@ -26,556 +112,305 @@ class FeesBody(BaseModel):
     end: Optional[str] = None
     symbols: Optional[List[str]] = None
 
-from openai import OpenAI
-from pinecone import Pinecone
-from datetime import datetime
-
-# -----------------------------------------------------------------------------
-# Config & clients
-# -----------------------------------------------------------------------------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
-PINECONE_INDEX = os.environ.get("PINECONE_INDEX", "rob-brain")
-
-# Embedding model MUST match index dimension (3072)
-EMBED_MODEL = "text-embedding-3-large"
-
-# ---- Bearer auth for Actions ----
-FOREVER_BRAIN_BEARER = os.environ.get("FOREVER_BRAIN_BEARER")
-
-def _check_bearer(authorization_header: Optional[str]):
-    """Raise 401 if the Authorization header is missing/invalid."""
-    if not FOREVER_BRAIN_BEARER:
-        raise HTTPException(status_code=500, detail="Server missing bearer key")
-    if not authorization_header or not authorization_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    token = authorization_header.split(" ", 1)[1].strip()
-    if token != FOREVER_BRAIN_BEARER:
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
-
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY")
-if not PINECONE_API_KEY:
-    raise RuntimeError("Missing PINECONE_API_KEY")
-
-# OpenAI
-oai = OpenAI(api_key=OPENAI_API_KEY)
-
-# Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX)
-
-# Namespaces we use
-ALL_NAMESPACES = ["fiction", "nonfiction", "trading", "personal", "reference"]
-
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-# -----------------------------------------------------------------------------
-# FastAPI app
-# -----------------------------------------------------------------------------
-app = FastAPI(title="Rob Forever Brain API", version="2.2.0")
-
-# Allow calls from your GPT/action UI
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
-class SearchBody(BaseModel):
-    query: str
-    top_k: int = 8
-    namespace: Optional[str] = None   # None or "all" -> search every namespace
-    symbols: Optional[List[str]] = None
-    tags: Optional[List[str]] = None
-
-class AskBody(BaseModel):
-    question: str
-    top_k: int = 12
-    namespace: Optional[str] = None       # None or "all" => search all
-    min_score: Optional[float] = None     # default applied in code
-    symbols: Optional[List[str]] = None
-    tags: Optional[List[str]] = None
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _norm_date(s: str) -> str:
-    """Return YYYY-MM-DD for mixed date strings like '7/9/2025' or '2025-07-09'."""
-    if not s:
-        return s
-    # Try common formats
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    # macOS strptime may not support %-m; try zero-padded as last resort
-    for fmt in ("%m/%d/%Y",):
-        try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    return s
-
-def embed_query(text: str) -> List[float]:
-    """Return an embedding vector for a query."""
-    t0 = time.time()
-    resp = oai.embeddings.create(model=EMBED_MODEL, input=text)
-    vec = resp.data[0].embedding
-    logging.info(f"🧠 Embed time: {time.time() - t0:.3f}s (dim={len(vec)})")
-    return vec
-
-def list_namespaces() -> List[str]:
-    """Return namespaces present in the index."""
-    try:
-        stats = index.describe_index_stats()
-        ns = sorted(list(stats.get("namespaces", {}).keys()))
-        return ns if ns else ALL_NAMESPACES
-    except Exception as e:
-        logging.error(f"describe_index_stats failed: {e}")
-        return ALL_NAMESPACES
-
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
+# ==== /healthz ====
 @app.get("/healthz")
 def healthz():
-    """Basic health + what namespaces exist right now + index dimension."""
     try:
-        desc = pc.describe_index(PINECONE_INDEX)   # control-plane call
-        index_dim = getattr(desc, "dimension", None)
-    except Exception as e:
-        index_dim = f"unknown ({e})"
-
+        stats = index.describe_index_stats()
+        # Try to detect the dimensionality if stored elsewhere
+        idx_dim = EMBED_DIM
+    except Exception:
+        stats = {}
+        idx_dim = EMBED_DIM
     return {
         "ok": True,
-        "index": PINECONE_INDEX,
-        "index_dimension": index_dim,
+        "index": INDEX_NAME,
+        "index_dimension": idx_dim,
         "embed_model": EMBED_MODEL,
-        "embed_model_dim": 3072,
-        "namespaces": list_namespaces(),
+        "embed_model_dim": EMBED_DIM,
+        "namespaces": list((stats.get("namespaces") or {}).keys()) or ["nonfiction", "trading"]
     }
 
+# ==== /search (legacy) ====
 @app.post("/search")
-def search(body: SearchBody, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+def search(body: SearchBody, authorization: Optional[str] = Header(default=None)):
     _check_bearer(authorization)
-    """
-    Legacy search (kept for compatibility).
-    If body.namespace is None or 'all', search ALL namespaces and combine results.
-    """
-    if body.namespace and body.namespace != "all":
-        namespaces_to_use = [body.namespace]
-    else:
-        namespaces_to_use = ALL_NAMESPACES
 
-    logging.info("🔍 /search request")
-    logging.info(f"Query: {body.query}")
-    logging.info(f"Namespaces searched: {namespaces_to_use}")
-    logging.info(f"Top K per namespace: {body.top_k}")
+    namespaces = []
+    if body.namespace in (None, "", "all"):
+        # probe common namespaces
+        namespaces = ["trading", "nonfiction"]
+    else:
+        namespaces = [body.namespace]
 
     vec = embed_query(body.query)
-
-    combined_results: List[Dict[str, Any]] = []
-    for ns in namespaces_to_use:
+    all_hits = []
+    for ns in namespaces:
         try:
-            t0 = time.time()
-            res = index.query(
-                vector=vec,
-                top_k=body.top_k,
-                namespace=ns,
-                include_metadata=True,
-            )
-            took = time.time() - t0
+            res = index.query(vector=vec, top_k=body.top_k, namespace=ns, include_metadata=True)
             matches = getattr(res, "matches", []) or []
-            logging.info(f"📦 Namespace '{ns}' returned {len(matches)} results in {took:.3f}s")
-
             for m in matches:
-                md = getattr(m, "metadata", {}) or {}
-                combined_results.append({
+                all_hits.append({
                     "namespace": ns,
-                    "id": getattr(m, "id", None),
                     "score": getattr(m, "score", None),
-                    "text": md.get("text"),
-                    "metadata": md,
+                    "metadata": getattr(m, "metadata", {}) or {},
+                    "id": getattr(m, "id", None)
                 })
-
         except Exception as e:
-            logging.error(f"❌ Error searching namespace '{ns}': {e}")
+            # non-fatal per-namespace
+            all_hits.append({"namespace": ns, "error": str(e)})
 
-    for i, hit in enumerate(combined_results[:3]):
-        snippet = (hit.get("text") or "")[:160].replace("\n", " ")
-        logging.info(f"▶ Hit {i+1} [{hit.get('namespace')}:{hit.get('score')}] {snippet!r}")
+    return {"ok": True, "hits": all_hits}
 
-    logging.info(f"✅ Total combined results: {len(combined_results)}")
-
-    return {
-        "namespaces_queried": namespaces_to_use,
-        "hits": combined_results,
-        "count": len(combined_results),
-    }
-
-# =========================
-# /ask endpoint
-# =========================
-
- # (make sure you have: import os)
-
+# ==== /ask ====
 @app.post("/ask")
-def ask(
-    body: AskBody,
-    authorization: Optional[str] = Header(default=None),
-):
-    """
-    Orchestrated endpoint for your GPT:
-      1) Always search vectors first (all namespaces by default)
-      2) If strong hits exist (>= min_score), return them as context
-      3) Otherwise return use_web=true so GPT falls back to web search
-    """
+def ask(body: AskBody, authorization: Optional[str] = Header(default=None)):
     _check_bearer(authorization)
 
-    ns = body.namespace or "all"
-    min_score = body.min_score or 0.34
-    top_k = body.top_k or 12
+    # choose namespaces
+    if body.namespace in (None, "", "all"):
+        namespaces = ["nonfiction", "trading"]
+    else:
+        namespaces = [body.namespace]
 
-    # Vector search
-    res = index.query(
-        vector=embed_query(body.question),
-        top_k=top_k,
-        namespace=None if ns == "all" else ns,
-        include_metadata=True,
-    )
-    matches = getattr(res, "matches", []) or []
+    min_score = 0.34 if body.min_score is None else float(body.min_score)
+    vec = embed_query(body.question)
 
-    # Strong hits, then sort best-first
-    strong_hits_unsorted = [m for m in matches if getattr(m, "score", 0.0) >= min_score]
-    strong_hits = sorted(
-        strong_hits_unsorted,
-        key=lambda m: float(getattr(m, "score", 0.0) or 0.0),
-        reverse=True,
-    )
+    hits = []
+    for ns in namespaces:
+        try:
+            res = index.query(vector=vec, top_k=body.top_k, namespace=ns, include_metadata=True)
+            matches = getattr(res, "matches", []) or []
+            for m in matches:
+                sc = getattr(m, "score", 0.0) or 0.0
+                md = getattr(m, "metadata", {}) or {}
+                text = md.get("text") or md.get("content") or ""
+                title = md.get("title") or md.get("symbol") or md.get("file") or ""
+                source = md.get("source") or md.get("file") or md.get("symbol") or ""
+                hits.append({
+                    "namespace": ns,
+                    "score": sc,
+                    "title": title,
+                    "source": source,
+                    "text": text
+                })
+        except Exception as e:
+            hits.append({"namespace": ns, "error": str(e), "score": 0.0, "text": ""})
 
-    # Caps
-    MAX_CONTEXT_CHARS  = int(os.getenv("MAX_CONTEXT_CHARS", "120000"))  # total chars
-    MAX_EXCERPT_CHARS  = int(os.getenv("MAX_EXCERPT_CHARS", "1500"))    # per hit
-    MAX_CONTEXT_ITEMS  = int(os.getenv("MAX_CONTEXT_ITEMS", "200"))     # max items
+    strong = [h for h in hits if isinstance(h.get("score"), (int, float)) and h["score"] >= min_score]
+    use_web = len(strong) == 0
 
-    context: List[Dict[str, Any]] = []
-    total_chars = 0
-    seen_keys = set()  # dedupe by (title, source)
-
-    for m in strong_hits:
-        if len(context) >= MAX_CONTEXT_ITEMS:
-            break
-
-        md = getattr(m, "metadata", {}) or {}
-        k = (md.get("title") or "", md.get("source") or "")
-        if k in seen_keys:
-            continue
-        seen_keys.add(k)
-
-        txt = (md.get("text") or "")
-        if txt and len(txt) > MAX_EXCERPT_CHARS:
-            txt = txt[:MAX_EXCERPT_CHARS] + "…"
-
-        add_len = len(txt)
-        if total_chars + add_len > MAX_CONTEXT_CHARS:
-            break
-
-        context.append({
-            "namespace": md.get("namespace") or md.get("ns") or "",
-            "score": float(getattr(m, "score", 0.0) or 0.0),
-            "title": md.get("title") or "",
-            "source": md.get("source") or "",
-            "text": txt,
-        })
-        total_chars += add_len
-
-    if not context:
-        return {
-            "answered_from": "none",
-            "use_web": True,
-            "min_score_used": min_score,
-            "namespaces_queried": [ns],
-            "hits_count": 0,
-            "context": [],
-            "suggested_instruction": "No strong vector hits found — fall back to web search."
-        }
+    # pack a small context to keep responses lean
+    # (You can send more if you like, but smaller is safer for GPT input)
+    strong_sorted = sorted(strong, key=lambda x: x["score"], reverse=True)
+    context = strong_sorted[: body.top_k]
 
     return {
-        "answered_from": "vector",
-        "use_web": False,
+        "answered_from": "vector" if not use_web else "none",
+        "use_web": use_web,
         "min_score_used": min_score,
-        "namespaces_queried": [ns],
-        "hits_count": len(strong_hits),
+        "namespaces_queried": namespaces,
+        "hits_count": len(context),
         "context": context,
         "suggested_instruction": "Use the context excerpts to answer the user's question. Cite titles/sources from context. If something is unclear or missing, say so."
     }
-# =========================
-# /fees endpoint (auto‑chunking)
-# =========================
-from datetime import date, timedelta
-import calendar
 
-def _parse_iso(d: str) -> date | None:
-    try:
-        y, m, d = d.split("-")
-        return date(int(y), int(m), int(d))
-    except Exception:
-        return None
-
-def _month_end(dt: date) -> date:
-    return date(dt.year, dt.month, calendar.monthrange(dt.year, dt.month)[1])
-
-def _daterange_chunks(start: date, end: date) -> list[tuple[date, date]]:
-    """Return small chunks to keep payloads tiny."""
-    days = (end - start).days + 1
-    # one month: split 1–15, 16–end
-    if start.year == end.year and start.month == end.month and days > 15:
-        mid = date(start.year, start.month, 15)
-        return [(start, mid), (mid + timedelta(days=1), end)]
-    # multi‑month or long windows: 10‑day chunks
-    chunks = []
-    cur = start
-    while cur <= end:
-        nxt = min(cur + timedelta(days=9), end)
-        chunks.append((cur, nxt))
-        cur = nxt + timedelta(days=1)
-    return chunks
-
+# ==== /fees (CSV rollup across common fee columns + borrow/overnight + trades fees_total) ====
 @app.post("/fees")
-def fees(
-    body: FeesBody,
-    authorization: Optional[str] = Header(default=None),
-):
-    """
-    Aggregate fee columns + borrow/overnight + trades rollup.
-    If the requested window is big (or dates omitted), we auto‑chunk
-    into smaller date ranges and combine totals to avoid size limits.
-    """
+def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
     _check_bearer(authorization)
 
-    # Resolve dates
-    start_str = body.start
-    end_str = body.end
+    start_dt = _parse_any_date(body.start) if body.start else None
+    end_dt   = _parse_any_date(body.end)   if body.end   else None
 
-    # If missing dates, default to the last full calendar month
-    if not (start_str and end_str):
-        today = date.today()
-        first_this_month = today.replace(day=1)
-        last_prev_month = first_this_month - timedelta(days=1)
-        start_dt = last_prev_month.replace(day=1)
-        end_dt = last_prev_month
-    else:
-        start_dt = _parse_iso(start_str)
-        end_dt = _parse_iso(end_str)
-        if not (start_dt and end_dt) or start_dt > end_dt:
-            raise HTTPException(status_code=400, detail="Invalid start/end; use YYYY-MM-DD and start<=end")
+    def in_range(dstr: str) -> bool:
+        if not (start_dt or end_dt):
+            return True
+        d = _parse_any_date(dstr)
+        if not d:
+            return False
+        if start_dt and d < start_dt: return False
+        if end_dt   and d > end_dt:   return False
+        return True
 
-    # Build chunks
-    chunks = _daterange_chunks(start_dt, end_dt)
+    ns = body.namespace or "trading"
+    vec = embed_query("broker activity trade rows fees columns borrow overnight fees_total")
+    res = index.query(vector=vec, top_k=body.top_k, namespace=ns, include_metadata=True)
+    matches = getattr(res, "matches", []) or []
 
-    # Accumulators
-    by_col_totals = {
-        "TransFee": 0.0, "ECNTaker": 0.0, "ECNMaker": 0.0,
-        "ORFFee": 0.0, "TAFFee": 0.0, "SECFee": 0.0,
-        "CATFee": 0.0, "Commissions": 0.0
-    }
-    borrow_fees_total = 0.0
-    overnight_fees_total = 0.0
-    trades_fees_total = 0.0
-    rows_scanned_sum = 0
+    fee_cols = ["TransFee", "ECNTaker", "ECNMaker", "ORFFee", "TAFFee", "SECFee", "CATFee", "Commissions"]
+    by_col = {c: 0.0 for c in fee_cols}
+    borrow_fees = 0.0
+    overnight_fees = 0.0
+    trades_total = 0.0
+    rows_scanned = 0
 
-    # Reuse your existing inner scan logic, but run it per chunk
-    for (c_start, c_end) in chunks:
-        # call your existing vector scan exactly as before, but with
-        # start=str(c_start), end=str(c_end)
-        res = _scan_fees_once(
-            file=body.file,
-            namespace=body.namespace,
-            query=body.query,
-            top_k=body.top_k,
-            start=str(c_start),
-            end=str(c_end),
-            symbols=body.symbols,
-        )
-        # res should be the same dict you already compute inside /fees today
-        # Accumulate
-        for k in by_col_totals:
-            by_col_totals[k] += float(res["totals"]["by_column"].get(k, 0.0))
-        borrow_fees_total      += float(res["totals"]["borrow_fees"])
-        overnight_fees_total   += float(res["totals"]["overnight_fees"])
-        trades_fees_total      += float(res["totals"]["trades_fees_total"])
-        rows_scanned_sum       += int(res.get("rows_scanned", 0))
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+        if body.file and str(md.get("file", "")).strip() != body.file.strip():
+            continue
+        if not in_range(str(md.get("date", ""))):
+            continue
 
-    grand_fee_cols = sum(by_col_totals.values()) + borrow_fees_total + overnight_fees_total
-    grand_all_in   = grand_fee_cols + trades_fees_total
+        # fee columns
+        for c in fee_cols:
+            by_col[c] += _safe_float(md.get(c, 0.0), 0.0)
+
+        ft = str(md.get("fee_type") or "").lower()
+        amt = _safe_float(md.get("amount", 0.0), 0.0)
+        if ft == "borrow_fee":
+            borrow_fees += amt
+        elif ft == "overnight_borrow_fee":
+            overnight_fees += amt
+
+        trades_total += _safe_float(md.get("fees_total", 0.0), 0.0)
+        rows_scanned += 1
+
+    grand_cols_borrow_overnight = sum(by_col.values()) + borrow_fees + overnight_fees
+    grand_all_in = grand_cols_borrow_overnight + trades_total
+
+    pretty_lines = []
+    pretty_lines.append(f"Rows scanned: {rows_scanned}")
+    pretty_lines.append("")
+    pretty_lines.append("--- Fee columns ---")
+    for c in fee_cols:
+        pretty_lines.append(f"{c:<9}: ${by_col[c]:,.2f}")
+    pretty_lines.append("")
+    pretty_lines.append(f"Borrow fees: ${borrow_fees:,.2f}")
+    pretty_lines.append(f"Overnight fees: ${overnight_fees:,.2f}")
+    pretty_lines.append("")
+    pretty_lines.append(f"fees_total (roll-up on trade rows): ${trades_total:,.2f}")
+    pretty_lines.append("")
+    pretty_lines.append("=== ALL-IN FEES (fee columns + borrow + overnight + trades fees_total) ===")
+    pretty_lines.append(f"${grand_all_in:,.2f}")
 
     return {
         "ok": True,
         "filters": {
-            "namespace": body.namespace,
+            "namespace": ns,
             "query": body.query,
             "top_k": body.top_k,
-            "start": str(start_dt),
-            "end": str(end_dt),
+            "start": body.start,
+            "end": body.end,
             "symbols": body.symbols,
             "file": body.file,
-            "auto_chunked": len(chunks) > 1,
-            "chunks": [{"start": str(a), "end": str(b)} for (a,b) in chunks],
         },
-        "rows_scanned": rows_scanned_sum,
+        "rows_scanned": rows_scanned,
         "totals": {
-            "by_column": by_col_totals,
-            "borrow_fees": borrow_fees_total,
-            "overnight_fees": overnight_fees_total,
-            "trades_fees_total": trades_fees_total,
-            "grand_total_fee_cols_borrow_overnight": grand_fee_cols,
+            "by_column": by_col,
+            "borrow_fees": borrow_fees,
+            "overnight_fees": overnight_fees,
+            "trades_fees_total": trades_total,
+            "grand_total_fee_cols_borrow_overnight": grand_cols_borrow_overnight,
             "grand_total_including_trades_rollup_if_needed": grand_all_in,
         },
-        # keep your existing 'pretty' if you like, but it’s optional now
+        "pretty": "\n".join(pretty_lines),
     }
 
-# =========================
-# /fees_summary endpoint
-# =========================
-from fastapi import Query
-
+# ==== /fees_summary (symbol-level daily & monthly) ====
 @app.post("/fees_summary")
 def fees_summary(
     symbol: str = Query(..., description="Stock symbol to summarize"),
     start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
-    top_k: int = Query(400, description="Number of results to consider"),
-    brief: bool = Query(False, description="If true, omit raw rows"),
-    authorization: Optional[str] = Header(default=None)
+    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
+    top_k: int                = Query(400, description="Number of results to consider"),
+    brief: bool               = Query(False, description="If true, omit raw rows"),
+    authorization: Optional[str] = Header(default=None),
 ):
-    """
-    Summarize borrow-related fees for a symbol in a date range.
-    - Returns split totals (borrow vs overnight), grand total
-    - Daily subtotals (date -> total)
-    - Monthly rollup (days_counted, total, avg_per_day, max_day)
-    """
     _check_bearer(authorization)
 
-    ns = "trading"
-    q = f"{symbol} borrow fee"  # simple query key; index is already pre-tagged
+    start_dt = _parse_any_date(start_date) if start_date else None
+    end_dt   = _parse_any_date(end_date)   if end_date   else None
+    sym_up = symbol.upper()
 
-    # Build a vector from the query for semantic search
-    vec = embed_query(q)
-
-    # Query Pinecone
-    res = index.query(
-        vector=vec,
-        top_k=top_k,
-        namespace=ns,
-        include_metadata=True,
-    )
-    matches = getattr(res, "matches", []) or []
-
-    # Filter to rows for this symbol + in date range + with a borrow-fee type
     def in_range(dstr: str) -> bool:
-        if not (start_date or end_date):
+        if not (start_dt or end_dt):
             return True
-        nd = _norm_date(dstr)
-        if start_date and nd < start_date:
+        d = _parse_any_date(dstr)
+        if not d:
             return False
-        if end_date and nd > end_date:
-            return False
+        if start_dt and d < start_dt: return False
+        if end_dt   and d > end_dt:   return False
         return True
 
-    rows: List[Dict[str, Any]] = []
+    ns = "trading"
+    vec = embed_query(f"{sym_up} STOCK BORROW FEE overnight borrow fee trading activity")
+    res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
+    matches = getattr(res, "matches", []) or []
+
+    rows = []
+    totals = {
+        "borrow_fee_total": 0.0,
+        "overnight_borrow_fee_total": 0.0,
+        "grand_total": 0.0,
+    }
+    daily: Dict[str, float] = {}
+
     for m in matches:
-        md = (getattr(m, "metadata", None) or {})
-        if (md.get("symbol") or "").upper() != symbol.upper():
+        md = getattr(m, "metadata", {}) or {}
+        if str(md.get("symbol", "")).upper() != sym_up:
             continue
-        ft = (md.get("fee_type") or "").lower()
-        if ft not in ("borrow_fee", "overnight_borrow_fee"):
-            continue
-        dstr = md.get("date") or ""
+
+        dstr = str(md.get("date", ""))
         if not in_range(dstr):
             continue
+
+        ft = str(md.get("fee_type", "")).lower()
+        amt = _safe_float(md.get("amount", 0.0), 0.0)
+        if ft not in ("borrow_fee", "overnight_borrow_fee"):
+            continue
+
         rows.append({
-            "date": _norm_date(dstr),
-            "amount": float(md.get("amount", 0.0)),
-            "description": md.get("description") or "",
+            "date": dstr,
+            "amount": amt,
+            "description": md.get("description", ""),
             "fee_type": ft,
-            "score": float(getattr(m, "score", 0.0) or 0.0),
+            "score": getattr(m, "score", 0.0) or 0.0
         })
 
-    # Totals split by fee type
-    borrow_total = sum(r["amount"] for r in rows if r["fee_type"] == "borrow_fee")
-    overnight_total = sum(r["amount"] for r in rows if r["fee_type"] == "overnight_borrow_fee")
-    grand_total = borrow_total + overnight_total
+        if ft == "borrow_fee":
+            totals["borrow_fee_total"] += amt
+        else:
+            totals["overnight_borrow_fee_total"] += amt
 
-    # Daily subtotals
-    daily: Dict[str, float] = {}
-    for r in rows:
-        daily[r["date"]] = daily.get(r["date"], 0.0) + r["amount"]
+        daily[dstr] = daily.get(dstr, 0.0) + amt
 
-    # Monthly rollup
-    days_counted = len(daily)
-    avg_per_day = (grand_total / days_counted) if days_counted else 0.0
-    if daily:
-        max_day_date = max(daily, key=lambda d: daily[d])
-        max_day = {"date": max_day_date, "total": daily[max_day_date]}
-    else:
-        max_day = {"date": None, "total": 0.0}
+    totals["grand_total"] = totals["borrow_fee_total"] + totals["overnight_borrow_fee_total"]
 
-    # Build compact response
-    resp = {
-        "symbol": symbol.upper(),
+    # monthly rollup
+    days = sorted(daily.items())
+    days_counted = len(days)
+    total_amt = totals["grand_total"]
+    avg_per_day = (total_amt / days_counted) if days_counted else 0.0
+    max_day = {"date": days[-1][0], "total": days[-1][1]} if days_counted else {"date": None, "total": 0.0}
+
+    out = {
+        "symbol": sym_up,
         "count": len(rows),
-        "totals": {
-            "borrow_fee_total": borrow_total,
-            "overnight_borrow_fee_total": overnight_total,
-            "grand_total": grand_total,
-        },
-        "daily_subtotals": daily,
+        "totals": totals,
+        "daily_subtotals": {d: v for d, v in days},
         "monthly_summary": {
             "days_counted": days_counted,
-            "total": grand_total,
+            "total": total_amt,
             "avg_per_day": avg_per_day,
             "max_day": max_day,
         },
     }
-
-    # Only include raw rows if NOT brief
     if not brief:
-        resp["rows"] = rows
+        out["rows"] = rows
+    return out
 
-    return resp
-
-# =========================
-# /short_pnl endpoint
-# =========================
-
-from typing import Optional, List, Dict, Any
-from fastapi import Query, Header
-
-@app.post("/short_pnl")
-def short_pnl(
+# ==== /fees_rollup (by symbol for a window) ====
+@app.post("/fees_rollup")
+def fees_rollup(
     start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date:   Optional[str] = Query(None, description="End date YYYY-MM-DD"),
-    symbols:    Optional[List[str]] = Query(None, description="Optional list of symbols to include"),
-    file:       Optional[str] = Query(None, description="Optional CSV filename to restrict"),
-    top_k:      int = Query(5000, description="How many rows to scan"),
+    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
+    top_k: int                = Query(5000, description="How many rows to scan"),
+    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
     authorization: Optional[str] = Header(default=None),
 ):
-    """
-    Compute realized PnL from shorting within a date window by pairing
-    SELL (open) and BUY (cover) trades (FIFO).
-    Only rows with Type == 'Short' are considered.
-    """
     _check_bearer(authorization)
 
-    # Parse date bounds
     start_dt = _parse_any_date(start_date) if start_date else None
     end_dt   = _parse_any_date(end_date)   if end_date   else None
 
@@ -585,261 +420,13 @@ def short_pnl(
         d = _parse_any_date(dstr)
         if not d:
             return False
-        if start_dt and d < start_dt:
-            return False
-        if end_dt and d > end_dt:
-            return False
-        return True
-
-    def norm_sym(x: Any) -> str:
-        return str(x or "").upper().strip()
-
-    def norm_side(md: Dict[str, Any]) -> str:
-        # Accept "B/S", "side", "Side", etc.
-        for k in ("B/S", "BS", "side", "Side", "b_s"):
-            if k in md:
-                v = str(md[k]).strip().lower()
-                if v in ("buy", "sell"):
-                    return v
-        # Some CSVs use "Action"
-        v = str(md.get("Action") or "").strip().lower()
-        if v in ("buy", "sell"):
-            return v
-        return ""
-
-    def norm_type(md: Dict[str, Any]) -> str:
-        v = str(md.get("Type") or md.get("type") or "").strip().lower()
-        return v
-
-    def norm_date(md: Dict[str, Any]) -> str:
-        return str(md.get("date") or md.get("Date") or "")
-
-    def to_float(x: Any) -> float:
-        s = str(x or "").replace(",", "").strip()
-        if s in ("", "nan", "None", "null"):
-            return 0.0
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
-
-    def get_qty(md: Dict[str, Any]) -> float:
-        for k in ("quantity", "Quantity", "qty", "Qty", "Shares"):
-            if k in md:
-                return to_float(md[k])
-        return 0.0
-
-    def get_price(md: Dict[str, Any]) -> float:
-        for k in ("price", "Price", "FillPrice", "AvgPrice", "avg_price"):
-            if k in md:
-                return to_float(md[k])
-        return 0.0
-
-    def get_symbol(md: Dict[str, Any]) -> str:
-        for k in ("symbol", "Symbol", "Ticker"):
-            if k in md:
-                return norm_sym(md[k])
-        return ""
-
-    ns = "trading"
-    # Broad vector to pull trade rows
-    vec = embed_query("short trade SELL BUY cover realized pnl fifo position matching")
-
-    res = index.query(
-        vector=vec,
-        top_k=top_k,
-        namespace=ns,
-        include_metadata=True,
-    )
-    matches = getattr(res, "matches", []) or []
-
-    # Optional filters
-    symbols_set = set(s.upper() for s in symbols) if symbols else None
-
-    # FIFO lots per symbol: list of dicts {shares_remaining, price}
-    lots: Dict[str, List[Dict[str, float]]] = {}
-    per_symbol: Dict[str, Dict[str, float]] = {}  # gross_proceeds, cover_cost, realized_pnl, shares_sold, shares_covered
-
-    rows_scanned = 0
-
-    for m in matches:
-        md = getattr(m, "metadata", {}) or {}
-
-        # file filter (if provided)
-        if file:
-            if str(md.get("file", "")).strip() != file.strip():
-                continue
-
-        # type must be "short"
-        if norm_type(md) != "short":
-            continue
-
-        # date window
-        dstr = norm_date(md)
-        if not in_range(dstr):
-            continue
-
-        sym = get_symbol(md)
-        if not sym:
-            continue
-        if symbols_set and sym not in symbols_set:
-            continue
-
-        side = norm_side(md)
-        if side not in ("sell", "buy"):
-            continue
-
-        qty = get_qty(md)
-        price = get_price(md)
-        # Normalize shares: use absolute size; sign in CSV may be neg for sells
-        shares = abs(qty)
-        if shares <= 0 or price <= 0:
-            continue
-
-        rows_scanned += 1
-        if sym not in per_symbol:
-            per_symbol[sym] = {
-                "gross_proceeds": 0.0,
-                "cover_cost": 0.0,
-                "realized_pnl": 0.0,
-                "shares_sold": 0.0,
-                "shares_covered": 0.0,
-            }
-        if sym not in lots:
-            lots[sym] = []
-
-        rec = per_symbol[sym]
-
-        if side == "sell":
-            # Opening short lot
-            lots[sym].append({"shares_remaining": shares, "price": price})
-            rec["gross_proceeds"] += shares * price
-            rec["shares_sold"] += shares
-        else:
-            # Cover: match FIFO against existing lots
-            remaining = shares
-            while remaining > 0 and lots[sym]:
-                lot = lots[sym][0]
-                take = min(remaining, lot["shares_remaining"])
-                sell_price = lot["price"]
-                buy_price = price
-                # For a short, pnl = (sell_price - buy_price) * shares
-                rec["realized_pnl"] += (sell_price - buy_price) * take
-                rec["cover_cost"] += buy_price * take
-
-                lot["shares_remaining"] -= take
-                remaining -= take
-
-                if lot["shares_remaining"] <= 1e-9:
-                    lots[sym].pop(0)
-
-            # If remaining > 0, that means we covered more than we had open;
-            # we count the buy cost for transparency but there's no matching lot
-            if remaining > 0:
-                rec["cover_cost"] += buy_price * remaining  # unmatched; rare
-            rec["shares_covered"] += shares
-
-    # Build response list
-    by_symbol = []
-    grand_gross = grand_cost = grand_pnl = 0.0
-    for sym, r in per_symbol.items():
-        by_symbol.append({
-            "symbol": sym,
-            "gross_proceeds": round(r["gross_proceeds"], 2),
-            "cover_cost": round(r["cover_cost"], 2),
-            "realized_pnl": round(r["realized_pnl"], 2),
-            "shares_sold": r["shares_sold"],
-            "shares_covered": r["shares_covered"],
-        })
-        grand_gross += r["gross_proceeds"]
-        grand_cost  += r["cover_cost"]
-        grand_pnl   += r["realized_pnl"]
-
-    # Sort by absolute realized PnL descending (nice to read)
-    by_symbol.sort(key=lambda x: abs(x["realized_pnl"]), reverse=True)
-
-    return {
-        "filters": {
-            "start_date": start_date,
-            "end_date": end_date,
-            "symbols": list(symbols_set) if symbols_set else None,
-            "file": file,
-            "top_k": top_k,
-            "namespace": ns,
-        },
-        "rows_scanned": rows_scanned,
-        "by_symbol": by_symbol,
-        "grand_totals": {
-            "gross_proceeds": round(grand_gross, 2),
-            "cover_cost": round(grand_cost, 2),
-            "realized_pnl": round(grand_pnl, 2),
-        },
-    }
-
-# =========================
-# /fees_rollup endpoint
-# =========================
-from fastapi import Query
-
-@app.post("/fees_rollup")
-def fees_rollup(
-    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
-    top_k: int                = Query(5000, description="How many rows to scan"),
-    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
-    authorization: Optional[str] = Header(default=None),
-):
-    """
-    Roll up borrow-related fees by symbol for a date window.
-    Includes fee rows tagged as `borrow_fee` or `overnight_borrow_fee`.
-    Returns: { by_symbol: [{symbol, total}], grand_total }
-    """
-    _check_bearer(authorization)
-
-    # Inline, safe date parsing (ISO YYYY-MM-DD, then US M/D/YYYY)
-    from datetime import datetime as _dt
-
-    def _parse_any_date_local(val: str):
-        if not val:
-            return None
-        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
-            try:
-                return _dt.strptime(val, fmt).date()
-            except Exception:
-                continue
-        # macOS may not support %-m; try zero‑padded as last resort
-        for fmt in ("%m/%d/%Y",):
-            try:
-                return _dt.strptime(val, fmt).date()
-            except Exception:
-                continue
-        return None
-
-    start_dt = _parse_any_date_local(start_date) if start_date else None
-    end_dt   = _parse_any_date_local(end_date)   if end_date   else None
-
-    def in_range(dstr: str) -> bool:
-        if not (start_dt or end_dt):
-            return True
-        d = _parse_any_date_local(dstr)
-        if not d:
-            return False
-        if start_dt and d < start_dt:
-            return False
-        if end_dt and d > end_dt:
-            return False
+        if start_dt and d < start_dt: return False
+        if end_dt   and d > end_dt:   return False
         return True
 
     ns = "trading"
-    # Neutral embedding to pull a wide net of fee rows
     vec = embed_query("stock borrow fee overnight borrow fee trading summary")
-
-    res = index.query(
-        vector=vec,
-        top_k=top_k,
-        namespace=ns,
-        include_metadata=True,
-    )
+    res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
     per_symbol: Dict[str, float] = {}
@@ -848,8 +435,6 @@ def fees_rollup(
 
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
-
-        # Optional file filter
         if file and str(md.get("file", "")).strip() != file.strip():
             continue
 
@@ -861,22 +446,26 @@ def fees_rollup(
         if not in_range(dstr):
             continue
 
-        sym = str(md.get("symbol", "")).upper().strip()
+        sym = str(md.get("symbol", "")).upper()
         if not sym:
-            continue  # skip rows that don't have a symbol
-
-        try:
-            amt = float(md.get("amount") or 0.0)
-        except Exception:
             continue
+
+        amt = _safe_float(md.get("amount", 0.0), 0.0)
 
         per_symbol[sym] = per_symbol.get(sym, 0.0) + amt
         grand_total += amt
         rows_scanned += 1
 
-    # Sort by total ascending (most negative first)
-    by_symbol = [{"symbol": s, "total": t} for s, t in per_symbol.items()]
-    by_symbol.sort(key=lambda x: x["total"])
+    by_symbol = [{"symbol": s, "total": v} for s, v in per_symbol.items()]
+    by_symbol.sort(key=lambda x: x["total"], reverse=False)
+
+    pretty = ["Rows scanned: {}".format(rows_scanned),
+              "--- Borrow-related fees by symbol ---"]
+    for row in sorted(by_symbol, key=lambda x: abs(x["total"]), reverse=True):
+        pretty.append(f'{row["symbol"]} : ${abs(row["total"]):,.2f}')
+    pretty.append("")
+    pretty.append("=== GRAND TOTAL ===")
+    pretty.append(f"${abs(grand_total):,.2f}")
 
     return {
         "filters": {
@@ -884,9 +473,143 @@ def fees_rollup(
             "end_date": end_date,
             "top_k": top_k,
             "file": file,
-            "namespace": ns,
+            "namespace": ns
         },
         "rows_scanned": rows_scanned,
         "by_symbol": by_symbol,
-        "grand_total": grand_total,
+        "grand_total": round(grand_total, 2),
+        "pretty": "\n".join(pretty)
     }
+
+# ==== /short_pnl (new) ====
+@app.post("/short_pnl")
+def short_pnl(
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str]   = Query(None),
+    top_k: int                = Query(5000),
+    file: Optional[str]       = Query(None),
+    authorization: Optional[str] = Header(default=None),
+):
+    _check_bearer(authorization)
+
+    start_dt = _parse_any_date(start_date) if start_date else None
+    end_dt   = _parse_any_date(end_date)   if end_date   else None
+
+    def in_range(dstr: str) -> bool:
+        if not (start_dt or end_dt):
+            return True
+        d = _parse_any_date(dstr)
+        if not d:
+            return False
+        if start_dt and d < start_dt: return False
+        if end_dt   and d > end_dt:   return False
+        return True
+
+    try:
+        ns = "trading"
+        vec = embed_query("broker activity trades short sell buy quantity price realized pnl")
+        res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
+        matches = getattr(res, "matches", []) or []
+
+        rows_scanned = 0
+        open_lots: Dict[str, List[Dict[str, float]]] = {}
+        realized_by_symbol: Dict[str, float] = {}
+        trades_used = 0
+
+        def pick(md, *keys, default=None):
+            for k in keys:
+                if k in md and md[k] not in (None, ""):
+                    return md[k]
+            return default
+
+        for m in matches:
+            md = getattr(m, "metadata", {}) or {}
+            if file and str(md.get("file", "")).strip() != file.strip():
+                continue
+            if not in_range(str(md.get("date", ""))):
+                continue
+
+            typ = str(pick(md, "Type", "type")).strip().lower()
+            if typ != "short":
+                continue
+
+            side = str(pick(md, "B/S", "BS", "b_s", "Side", "side")).strip().lower()
+            if side not in ("sell", "buy"):
+                continue
+
+            sym = str(pick(md, "symbol", "Symbol", "SYM")).strip().upper()
+            if not sym:
+                continue
+
+            qty_raw = pick(md, "Quantity", "Qty", "Shares", "quantity", "qty", default=0)
+            try:
+                q = float(str(qty_raw).replace(",", ""))
+            except Exception:
+                continue
+            shares = abs(q)
+            if shares <= 0:
+                continue
+
+            price_raw = pick(md, "Price", "FillPrice", "Fill", "price", default=None)
+            if price_raw is None:
+                continue
+            try:
+                price = float(str(price_raw).replace(",", ""))
+            except Exception:
+                continue
+
+            rows_scanned += 1
+            trades_used += 1
+
+            if side == "sell":
+                open_lots.setdefault(sym, []).append({"shares": shares, "price": price})
+            else:
+                remaining = shares
+                lots = open_lots.get(sym, [])
+                while remaining > 0 and lots:
+                    lot = lots[0]
+                    take = min(remaining, lot["shares"])
+                    pnl = (lot["price"] - price) * take  # short pnl
+                    realized_by_symbol[sym] = realized_by_symbol.get(sym, 0.0) + pnl
+                    lot["shares"] -= take
+                    remaining -= take
+                    if lot["shares"] <= 1e-9:
+                        lots.pop(0)
+
+        by_symbol = [{"symbol": s, "realized_pnl": round(v, 2)} for s, v in realized_by_symbol.items()]
+        by_symbol.sort(key=lambda x: x["realized_pnl"], reverse=True)
+        total_realized = round(sum(x["realized_pnl"] for x in by_symbol), 2)
+
+        open_short_shares = {
+            s: round(sum(l["shares"] for l in lots), 2)
+            for s, lots in open_lots.items() if lots
+        }
+
+        return {
+            "ok": True,
+            "filters": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "top_k": top_k,
+                "file": file,
+                "namespace": ns,
+            },
+            "rows_scanned": rows_scanned,
+            "trades_used": trades_used,
+            "realized_by_symbol": by_symbol,
+            "total_realized_pnl": total_realized,
+            "open_short_shares_by_symbol": open_short_shares,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "short_pnl_failed",
+            "message": str(e),
+            "filters": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "top_k": top_k,
+                "file": file,
+            },
+        }
