@@ -545,6 +545,11 @@ def fees_summary(
 # =========================
 from fastapi import Query
 
+# =========================
+# /fees_rollup endpoint
+# =========================
+from fastapi import Query
+
 @app.post("/fees_rollup")
 def fees_rollup(
     start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
@@ -560,14 +565,32 @@ def fees_rollup(
     """
     _check_bearer(authorization)
 
-    # Parse date bounds (supports ISO 'YYYY-MM-DD' and US 'M/D/YYYY')
-    start_dt = _parse_any_date(start_date) if start_date else None
-    end_dt   = _parse_any_date(end_date)   if end_date   else None
+    # Inline, safe date parsing (ISO YYYY-MM-DD, then US M/D/YYYY)
+    from datetime import datetime as _dt
+
+    def _parse_any_date_local(val: str):
+        if not val:
+            return None
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
+            try:
+                return _dt.strptime(val, fmt).date()
+            except Exception:
+                continue
+        # macOS may not support %-m; try zero‑padded as last resort
+        for fmt in ("%m/%d/%Y",):
+            try:
+                return _dt.strptime(val, fmt).date()
+            except Exception:
+                continue
+        return None
+
+    start_dt = _parse_any_date_local(start_date) if start_date else None
+    end_dt   = _parse_any_date_local(end_date)   if end_date   else None
 
     def in_range(dstr: str) -> bool:
         if not (start_dt or end_dt):
             return True
-        d = _parse_any_date(dstr)
+        d = _parse_any_date_local(dstr)
         if not d:
             return False
         if start_dt and d < start_dt:
@@ -594,6 +617,7 @@ def fees_rollup(
 
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
+
         # Optional file filter
         if file and str(md.get("file", "")).strip() != file.strip():
             continue
@@ -606,18 +630,20 @@ def fees_rollup(
         if not in_range(dstr):
             continue
 
-        # Get symbol and skip if missing
         sym = str(md.get("symbol", "")).upper().strip()
         if not sym:
             continue  # skip rows that don't have a symbol
 
-        amt = _f(md.get("amount"))
+        try:
+            amt = float(md.get("amount") or 0.0)
+        except Exception:
+            continue
 
         per_symbol[sym] = per_symbol.get(sym, 0.0) + amt
         grand_total += amt
         rows_scanned += 1
 
-    # Sort by total ascending (most negative first, like your jq sort)
+    # Sort by total ascending (most negative first)
     by_symbol = [{"symbol": s, "total": t} for s, t in per_symbol.items()]
     by_symbol.sort(key=lambda x: x["total"])
 
@@ -628,8 +654,8 @@ def fees_rollup(
             "top_k": top_k,
             "file": file,
             "namespace": ns,
-            "rows_scanned": rows_scanned,
         },
+        "rows_scanned": rows_scanned,
         "by_symbol": by_symbol,
         "grand_total": grand_total,
     }
