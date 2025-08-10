@@ -537,7 +537,8 @@ def fees_summary(
     else:
         max_day = {"date": None, "total": 0.0}
 
-    return {
+        # Build compact response first
+    resp = {
         "symbol": symbol.upper(),
         "count": len(rows),
         "totals": {
@@ -545,12 +546,17 @@ def fees_summary(
             "overnight_borrow_fee_total": overnight_total,
             "grand_total": grand_total,
         },
-        "daily_subtotals": daily,         # { 'YYYY-MM-DD': total }
+        "daily_subtotals": daily,
         "monthly_summary": {
             "days_counted": days_counted,
             "total": grand_total,
             "avg_per_day": avg_per_day,
             "max_day": max_day,
         },
-        "rows": rows,  # still include raw rows for transparency
     }
+
+    # Only include raw rows if NOT brief
+    if not brief:
+        resp["rows"] = rows
+
+    return resp
