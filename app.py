@@ -18,8 +18,8 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_INDEX = os.environ.get("PINECONE_INDEX", "rob-brain")
 
-# Embedding model MUST match index dimension (1536)
-EMBED_MODEL = "text-embedding-3-small"  # 1536 dims
+# Embedding model MUST match index dimension (3072)
+EMBED_MODEL = "text-embedding-3-large"
 
 # ---- Bearer auth for Actions ----
 FOREVER_BRAIN_BEARER = os.environ.get("FOREVER_BRAIN_BEARER")
