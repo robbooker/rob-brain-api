@@ -438,8 +438,33 @@ def fees_summary(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     top_k: int = 400,
+    brief: bool = False,                          # ← add this
     authorization: Optional[str] = Header(default=None)
 ):
+
+# build the base response
+    resp = {
+        "symbol": symbol.upper(),
+        "count": len(rows),
+        "totals": {
+            "borrow_fee_total": borrow_total,
+            "overnight_borrow_fee_total": overnight_total,
+            "grand_total": grand_total,
+        },
+        "daily_subtotals": daily,
+        "monthly_summary": {
+            "days_counted": days_counted,
+            "total": grand_total,
+            "avg_per_day": avg_per_day,
+            "max_day": max_day,
+        },
+    }
+
+    # only include the raw rows when NOT in brief mode
+    if not brief:
+        resp["rows"] = rows
+
+    return resp
     """
     Summarize borrow-related fees for a symbol in a date range.
     - Returns split totals (borrow vs overnight), grand total
