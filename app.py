@@ -297,115 +297,104 @@ def ask(body: AskBody, authorization: Optional[str] = Header(default=None)) -> D
     }
 
 # =========================
-# /fees endpoint (trading)
+# /fees endpoint (auto‑chunking)
 # =========================
-class FeesBody(BaseModel):
-    file: Optional[str] = None
-    namespace: str = "trading"
-    query: str = "*"              # semantic “grab bag”; we’ll use a neutral embedding
-    top_k: int = 5000
-    start: Optional[str] = None   # "YYYY-MM-DD"
-    end: Optional[str] = None
-    symbols: Optional[List[str]] = None
+from datetime import date, timedelta
+import calendar
 
-def _f(x) -> float:
+def _parse_iso(d: str) -> date | None:
     try:
-        if x is None: return 0.0
-        if isinstance(x, (int, float)): return float(x)
-        s = str(x).strip().replace(",", "")
-        return float(s) if s not in ("", "null", "None") else 0.0
+        y, m, d = d.split("-")
+        return date(int(y), int(m), int(d))
     except Exception:
-        return 0.0
+        return None
 
-def _pass_filters(md: Dict[str, Any],
-                  file: Optional[str],
-                  symbols: Optional[List[str]],
-                  start: Optional[str],
-                  end: Optional[str]) -> bool:
-    # file filter
-    if file and str(md.get("file", "")).strip() != file.strip():
-        return False
-    # date filter (YYYY-MM-DD)
-    d = str(md.get("date", ""))[:10]
-    if start and d and d < start:
-        return False
-    if end and d and d > end:
-        return False
-    # symbols filter
-    if symbols:
-        sy = str(md.get("symbol", "")).upper()
-        want = {s.upper() for s in symbols}
-        if sy not in want:
-            return False
-    return True
+def _month_end(dt: date) -> date:
+    return date(dt.year, dt.month, calendar.monthrange(dt.year, dt.month)[1])
+
+def _daterange_chunks(start: date, end: date) -> list[tuple[date, date]]:
+    """Return small chunks to keep payloads tiny."""
+    days = (end - start).days + 1
+    # one month: split 1–15, 16–end
+    if start.year == end.year and start.month == end.month and days > 15:
+        mid = date(start.year, start.month, 15)
+        return [(start, mid), (mid + timedelta(days=1), end)]
+    # multi‑month or long windows: 10‑day chunks
+    chunks = []
+    cur = start
+    while cur <= end:
+        nxt = min(cur + timedelta(days=9), end)
+        chunks.append((cur, nxt))
+        cur = nxt + timedelta(days=1)
+    return chunks
 
 @app.post("/fees")
-def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
+def fees(
+    body: FeesBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Aggregate fee columns + borrow/overnight + trades rollup.
+    If the requested window is big (or dates omitted), we auto‑chunk
+    into smaller date ranges and combine totals to avoid size limits.
+    """
     _check_bearer(authorization)
 
-    # 1) Get a neutral embedding so we can pull lots of rows
-    vec = embed_query("broker fee commission borrow overnight summary query")
+    # Resolve dates
+    start_str = body.start
+    end_str = body.end
 
-    # 2) Query Pinecone
-    res = index.query(
-        vector=vec,
-        top_k=body.top_k,
-        namespace=body.namespace,
-        include_metadata=True,
-    )
-    matches = getattr(res, "matches", []) or []
-
-    # 3) Accumulators
-    fee_cols = ["TransFee", "ECNTaker", "ECNMaker", "ORFFee", "TAFFee", "SECFee", "CATFee", "Commissions"]
-    by_col = {k: 0.0 for k in fee_cols}
-    borrow_total = 0.0
-    overnight_total = 0.0
-    trades_fees_total = 0.0  # sums metadata.fees_total for trade rows
-    rows_scanned = 0
-
-    # 4) Walk results & sum
-    for m in matches:
-        md = getattr(m, "metadata", {}) or {}
-        if not _pass_filters(md, body.file, body.symbols, body.start, body.end):
-            continue
-        rows_scanned += 1
-
-        # per-column fees if present
-        for k in fee_cols:
-            by_col[k] += _f(md.get(k))
-
-        # trades_fees_total: sum the roll‑up fee you stored on trade rows
-        trades_fees_total += _f(md.get("fees_total"))
-
-        # borrow/overnight totals (you tagged these on fee rows)
-        ft = (md.get("fee_type") or "").lower()
-        amt = _f(md.get("amount"))
-        if ft == "borrow_fee":
-            borrow_total += amt
-        elif ft in ("overnight_borrow_fee", "overnight_fee"):
-            overnight_total += amt
-
-    # 5) Build totals
-    fee_cols_sum = sum(by_col.values())
-    grand_total = fee_cols_sum + borrow_total + overnight_total
-    combined_including_trades_rollup = (
-        grand_total + trades_fees_total if fee_cols_sum == 0.0 else grand_total
-    )
-
-    pretty = []
-    pretty.append(f"Rows scanned: {rows_scanned}\n")
-    pretty.append("--- Fee columns ---")
-    for k in fee_cols:
-        pretty.append(f"{k:10s}: ${by_col[k]:.2f}")
-    pretty.append(f"\nBorrow fees: ${borrow_total:.2f}")
-    pretty.append(f"Overnight fees: ${overnight_total:.2f}")
-    if fee_cols_sum == 0.0:
-        pretty.append(f"\nfees_total (roll‑up on trade rows): ${trades_fees_total:.2f}")
-        pretty.append("\n=== ALL-IN FEES (fee columns + borrow + overnight + trades fees_total) ===")
-        pretty.append(f"${combined_including_trades_rollup:.2f}")
+    # If missing dates, default to the last full calendar month
+    if not (start_str and end_str):
+        today = date.today()
+        first_this_month = today.replace(day=1)
+        last_prev_month = first_this_month - timedelta(days=1)
+        start_dt = last_prev_month.replace(day=1)
+        end_dt = last_prev_month
     else:
-        pretty.append("\n=== ALL-IN FEES (fee columns + borrow + overnight) ===")
-        pretty.append(f"${grand_total:.2f}")
+        start_dt = _parse_iso(start_str)
+        end_dt = _parse_iso(end_str)
+        if not (start_dt and end_dt) or start_dt > end_dt:
+            raise HTTPException(status_code=400, detail="Invalid start/end; use YYYY-MM-DD and start<=end")
+
+    # Build chunks
+    chunks = _daterange_chunks(start_dt, end_dt)
+
+    # Accumulators
+    by_col_totals = {
+        "TransFee": 0.0, "ECNTaker": 0.0, "ECNMaker": 0.0,
+        "ORFFee": 0.0, "TAFFee": 0.0, "SECFee": 0.0,
+        "CATFee": 0.0, "Commissions": 0.0
+    }
+    borrow_fees_total = 0.0
+    overnight_fees_total = 0.0
+    trades_fees_total = 0.0
+    rows_scanned_sum = 0
+
+    # Reuse your existing inner scan logic, but run it per chunk
+    for (c_start, c_end) in chunks:
+        # call your existing vector scan exactly as before, but with
+        # start=str(c_start), end=str(c_end)
+        res = _scan_fees_once(
+            file=body.file,
+            namespace=body.namespace,
+            query=body.query,
+            top_k=body.top_k,
+            start=str(c_start),
+            end=str(c_end),
+            symbols=body.symbols,
+        )
+        # res should be the same dict you already compute inside /fees today
+        # Accumulate
+        for k in by_col_totals:
+            by_col_totals[k] += float(res["totals"]["by_column"].get(k, 0.0))
+        borrow_fees_total      += float(res["totals"]["borrow_fees"])
+        overnight_fees_total   += float(res["totals"]["overnight_fees"])
+        trades_fees_total      += float(res["totals"]["trades_fees_total"])
+        rows_scanned_sum       += int(res.get("rows_scanned", 0))
+
+    grand_fee_cols = sum(by_col_totals.values()) + borrow_fees_total + overnight_fees_total
+    grand_all_in   = grand_fee_cols + trades_fees_total
 
     return {
         "ok": True,
@@ -413,21 +402,23 @@ def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
             "namespace": body.namespace,
             "query": body.query,
             "top_k": body.top_k,
-            "start": body.start,
-            "end": body.end,
+            "start": str(start_dt),
+            "end": str(end_dt),
             "symbols": body.symbols,
             "file": body.file,
+            "auto_chunked": len(chunks) > 1,
+            "chunks": [{"start": str(a), "end": str(b)} for (a,b) in chunks],
         },
-        "rows_scanned": rows_scanned,
+        "rows_scanned": rows_scanned_sum,
         "totals": {
-            "by_column": by_col,
-            "borrow_fees": borrow_total,
-            "overnight_fees": overnight_total,
+            "by_column": by_col_totals,
+            "borrow_fees": borrow_fees_total,
+            "overnight_fees": overnight_fees_total,
             "trades_fees_total": trades_fees_total,
-            "grand_total_fee_cols_borrow_overnight": grand_total,
-            "grand_total_including_trades_rollup_if_needed": combined_including_trades_rollup,
+            "grand_total_fee_cols_borrow_overnight": grand_fee_cols,
+            "grand_total_including_trades_rollup_if_needed": grand_all_in,
         },
-        "pretty": "\n".join(pretty),
+        # keep your existing 'pretty' if you like, but it’s optional now
     }
 
 # =========================
