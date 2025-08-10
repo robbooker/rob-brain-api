@@ -140,7 +140,7 @@ def healthz():
         "index": PINECONE_INDEX,
         "index_dimension": index_dim,
         "embed_model": EMBED_MODEL,
-        "embed_model_dim": 1536,
+        "embed_model_dim": 3072,
         "namespaces": list_namespaces(),
     }
 
