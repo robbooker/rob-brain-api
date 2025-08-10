@@ -606,10 +606,12 @@ def fees_rollup(
         if not in_range(dstr):
             continue
 
+        # Get symbol and skip if missing
         sym = str(md.get("symbol", "")).upper().strip()
         if not sym:
-        continue  # skip rows that don't have a symbol
-        amt = _f(md.get("amount"))
+            continue  # skip rows that don't have a symbol
+
+        amt = float(md.get("amount") or 0.0)
 
         per_symbol[sym] = per_symbol.get(sym, 0.0) + amt
         grand_total += amt
