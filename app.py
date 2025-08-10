@@ -88,6 +88,18 @@ class AskBody(BaseModel):
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+from datetime import datetime, date
+
+def _parse_any_date(s: str):
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    return None
+    
 def embed_query(text: str) -> List[float]:
     """Return an embedding vector for a query."""
     t0 = time.time()
@@ -416,61 +428,101 @@ def fees(body: FeesBody):
     }
 from datetime import datetime
 
+from typing import Optional
+from fastapi import Header, HTTPException
+
 @app.post("/fees_summary")
 def fees_summary(
     symbol: str,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    top_k: int = 200,
-    authorization: Optional[str] = Header(default=None)
+    top_k: int = 400,
+    authorization: Optional[str] = Header(default=None),
 ):
+    """
+    Summarize borrow/overnight fees for a single symbol within an optional date range.
+    Accepts POST with query-string params, e.g.:
+      /fees_summary?symbol=NDRA&start_date=2025-07-01&end_date=2025-07-31&top_k=400
+    """
     _check_bearer(authorization)
 
-    vec = embed_query(symbol + " borrow fee")
+    # --- parse dates strictly to date objects ---
+    start_d = _parse_any_date(start_date) if start_date else None
+    end_d   = _parse_any_date(end_date) if end_date else None
+
+    # --- build the query text and embed once ---
+    qtext = f"{symbol} borrow fee"
+    vec = embed_query(qtext)
+
+    # --- query the 'trading' namespace only (fee records live there) ---
     res = index.query(
         vector=vec,
-        top_k=top_k,
+        top_k=min(max(top_k, 50), 500),   # clamp a bit, 50..500
         namespace="trading",
         include_metadata=True,
     )
 
-    matches = getattr(res, "matches", []) or []
-    rows = []
-
     total = 0.0
-    for m in matches:
-        md = m.metadata or {}
-        sym = (md.get("symbol") or "").upper()
-        amt = md.get("amount") or 0.0
-        date_str = md.get("date")
+    rows  = []
 
-        # Skip if not the same symbol
+    # --- walk matches and apply strict date filtering ---
+    matches = getattr(res, "matches", []) or []
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+        # symbol filter (case-insensitive exact ticker match)
+        sym = (md.get("symbol") or "").upper()
         if sym != symbol.upper():
             continue
 
-        # Filter by date range if provided
-        if start_date or end_date:
-            try:
-                d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                if start_date and d < datetime.strptime(start_date, "%Y-%m-%d").date():
-                    continue
-                if end_date and d > datetime.strptime(end_date, "%Y-%m-%d").date():
-                    continue
-            except:
-                pass
+        # parse and filter by date
+        dstr = md.get("date") or ""              # can be "2025-07-09" or "7/9/2025"
+        dobj = _parse_any_date(dstr)
+        if not dobj:
+            continue
+        if start_d and dobj < start_d:
+            continue
+        if end_d and dobj > end_d:
+            continue
+
+        # amount (as number)
+        amt = md.get("amount")
+        try:
+            amt = float(0 if amt in (None, "") else amt)
+        except Exception:
+            continue
+
+        # only borrow-related fees (carry and overnight)
+        fee_type = (md.get("fee_type") or "").strip()
+        desc = (md.get("description") or "")
+        if not fee_type:
+            # light fallback classifier if fee_type missing
+            U = desc.upper()
+            if "BORROW FEE" in U and " C " in U:
+                fee_type = "borrow_fee"
+            elif "BORROW FEE" in U:
+                fee_type = "overnight_borrow_fee"
+            else:
+                # not a borrow fee → skip
+                continue
+
+        if fee_type not in ("borrow_fee", "overnight_borrow_fee"):
+            continue
 
         total += amt
         rows.append({
-            "date": date_str,
+            "date": dobj.isoformat(),
             "amount": amt,
-            "description": md.get("description", ""),
-            "fee_type": md.get("fee_type", ""),
-            "score": m.score
+            "description": desc,
+            "fee_type": fee_type,
+            "score": getattr(m, "score", None),
         })
+
+    # sort rows by date (oldest → newest)
+    rows.sort(key=lambda r: r["date"])
 
     return {
         "symbol": symbol.upper(),
         "total": total,
         "count": len(rows),
-        "rows": rows
+        "rows": rows,
     }
