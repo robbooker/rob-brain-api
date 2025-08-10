@@ -225,6 +225,8 @@ def search(body: SearchBody, authorization: Optional[str] = Header(default=None)
 # /ask endpoint
 # =========================
 
+ # (make sure you have: import os)
+
 @app.post("/ask")
 def ask(
     body: AskBody,
@@ -242,34 +244,27 @@ def ask(
     min_score = body.min_score or 0.34
     top_k = body.top_k or 12
 
-    # Step 1: search vectors
-    search_body = {
-        "query": body.question,
-        "top_k": top_k,
-    }
-    if ns != "all":
-        search_body["namespace"] = ns
-    if body.symbols:
-        search_body["symbols"] = body.symbols
-    if body.tags:
-        search_body["tags"] = body.tags
-
+    # Vector search
     res = index.query(
         vector=embed_query(body.question),
         top_k=top_k,
         namespace=None if ns == "all" else ns,
         include_metadata=True,
     )
-
     matches = getattr(res, "matches", []) or []
 
-    # Filter strong hits
-    strong_hits = [m for m in matches if getattr(m, "score", 0.0) >= min_score]
+    # Strong hits, then sort best-first
+    strong_hits_unsorted = [m for m in matches if getattr(m, "score", 0.0) >= min_score]
+    strong_hits = sorted(
+        strong_hits_unsorted,
+        key=lambda m: float(getattr(m, "score", 0.0) or 0.0),
+        reverse=True,
+    )
 
     # Caps
-    MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "120000"))  # total chars
-    MAX_EXCERPT_CHARS = int(os.getenv("MAX_EXCERPT_CHARS", "1500"))    # per hit
-    MAX_CONTEXT_ITEMS = int(os.getenv("MAX_CONTEXT_ITEMS", "200"))     # max items
+    MAX_CONTEXT_CHARS  = int(os.getenv("MAX_CONTEXT_CHARS", "120000"))  # total chars
+    MAX_EXCERPT_CHARS  = int(os.getenv("MAX_EXCERPT_CHARS", "1500"))    # per hit
+    MAX_CONTEXT_ITEMS  = int(os.getenv("MAX_CONTEXT_ITEMS", "200"))     # max items
 
     context: List[Dict[str, Any]] = []
     total_chars = 0
@@ -302,7 +297,6 @@ def ask(
         })
         total_chars += add_len
 
-    # Step 2: if no strong hits, fallback
     if not context:
         return {
             "answered_from": "none",
@@ -314,7 +308,6 @@ def ask(
             "suggested_instruction": "No strong vector hits found — fall back to web search."
         }
 
-    # Step 3: return results
     return {
         "answered_from": "vector",
         "use_web": False,
@@ -324,7 +317,6 @@ def ask(
         "context": context,
         "suggested_instruction": "Use the context excerpts to answer the user's question. Cite titles/sources from context. If something is unclear or missing, say so."
     }
-
 # =========================
 # /fees endpoint (auto‑chunking)
 # =========================
