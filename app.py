@@ -67,7 +67,7 @@ def embed_query(text: str) -> List[float]:
     """Return an embedding vector for a query."""
     t0 = time.time()
     resp = oai.embeddings.create(
-        model="text-embedding-3-small",
+        model="text-embedding-3-large",  # 3072-dim to match your Pinecone index
         input=text
     )
     vec = resp.data[0].embedding
