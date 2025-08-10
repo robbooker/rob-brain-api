@@ -91,7 +91,7 @@ class AskBody(BaseModel):
 def embed_query(text: str) -> List[float]:
     """Return an embedding vector for a query."""
     t0 = time.time()
-    resp = oai.embeddings.create(model=EMBED_MODEL, input=text)
+    resp = oai.embeddings.create(model="text-embedding-3-large", input=text)
     vec = resp.data[0].embedding
     logging.info(f"🧠 Embed time: {time.time() - t0:.3f}s (dim={len(vec)})")
     return vec
