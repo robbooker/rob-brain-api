@@ -95,10 +95,18 @@ def list_namespaces() -> List[str]:
 # -----------------------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
-    """Basic health + what namespaces exist right now."""
+    """Basic health + what namespaces exist right now + index dimension."""
+    try:
+        desc = pc.describe_index(PINECONE_INDEX)   # <- control-plane call
+        index_dim = getattr(desc, "dimension", None)
+    except Exception as e:
+        index_dim = f"unknown ({e})"
+
     return {
         "ok": True,
         "index": PINECONE_INDEX,
+        "index_dimension": index_dim,              # <-- add this
+        "embed_model_dim": 1536,                   # text-embedding-3-small
         "namespaces": list_namespaces(),
     }
 
