@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from openai import OpenAI
 from pinecone import Pinecone
+from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # Config & clients
@@ -17,15 +18,15 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_INDEX = os.environ.get("PINECONE_INDEX", "rob-brain")
 
-EMBED_MODEL = "text-embedding-3-large"
+# Embedding model MUST match index dimension (1536)
+EMBED_MODEL = "text-embedding-3-small"  # 1536 dims
 
 # ---- Bearer auth for Actions ----
 FOREVER_BRAIN_BEARER = os.environ.get("FOREVER_BRAIN_BEARER")
 
-def _check_bearer(authorization_header: str | None):
+def _check_bearer(authorization_header: Optional[str]):
     """Raise 401 if the Authorization header is missing/invalid."""
     if not FOREVER_BRAIN_BEARER:
-        # If you forgot to set it on Render, fail closed.
         raise HTTPException(status_code=500, detail="Server missing bearer key")
     if not authorization_header or not authorization_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -37,8 +38,6 @@ if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
 if not PINECONE_API_KEY:
     raise RuntimeError("Missing PINECONE_API_KEY")
-
-EMBED_MODEL = "text-embedding-3-small"  # 1536 dims (matches your index)
 
 # OpenAI
 oai = OpenAI(api_key=OPENAI_API_KEY)
@@ -56,7 +55,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Rob Forever Brain API", version="2.1.0")
+app = FastAPI(title="Rob Forever Brain API", version="2.2.0")
 
 # Allow calls from your GPT/action UI
 app.add_middleware(
@@ -88,12 +87,11 @@ class AskBody(BaseModel):
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-from datetime import datetime
-
 def _norm_date(s: str) -> str:
     """Return YYYY-MM-DD for mixed date strings like '7/9/2025' or '2025-07-09'."""
     if not s:
         return s
+    # Try common formats
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
@@ -106,23 +104,11 @@ def _norm_date(s: str) -> str:
         except Exception:
             pass
     return s
-    
-from datetime import datetime, date
 
-def _parse_any_date(s: str):
-    if not s:
-        return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y", "%m/%d/%y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            continue
-    return None
-    
 def embed_query(text: str) -> List[float]:
     """Return an embedding vector for a query."""
     t0 = time.time()
-    resp = oai.embeddings.create(model="text-embedding-3-large", input=text)
+    resp = oai.embeddings.create(model=EMBED_MODEL, input=text)
     vec = resp.data[0].embedding
     logging.info(f"🧠 Embed time: {time.time() - t0:.3f}s (dim={len(vec)})")
     return vec
@@ -144,7 +130,7 @@ def list_namespaces() -> List[str]:
 def healthz():
     """Basic health + what namespaces exist right now + index dimension."""
     try:
-        desc = pc.describe_index(PINECONE_INDEX)   # <- control-plane call
+        desc = pc.describe_index(PINECONE_INDEX)   # control-plane call
         index_dim = getattr(desc, "dimension", None)
     except Exception as e:
         index_dim = f"unknown ({e})"
@@ -152,14 +138,15 @@ def healthz():
     return {
         "ok": True,
         "index": PINECONE_INDEX,
-        "index_dimension": index_dim,              # <-- add this
-        "embed_model_dim": 1536,                   # text-embedding-3-small
+        "index_dimension": index_dim,
+        "embed_model": EMBED_MODEL,
+        "embed_model_dim": 1536,
         "namespaces": list_namespaces(),
     }
 
 @app.post("/search")
 def search(body: SearchBody, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    _check_bearer(authorization)   # ← add this line
+    _check_bearer(authorization)
     """
     Legacy search (kept for compatibility).
     If body.namespace is None or 'all', search ALL namespaces and combine results.
@@ -217,7 +204,7 @@ def search(body: SearchBody, authorization: Optional[str] = Header(default=None)
 
 @app.post("/ask")
 def ask(body: AskBody, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    _check_bearer(authorization)   # ← add this line
+    _check_bearer(authorization)
     """
     Orchestrated endpoint for your GPT:
       1) Always search vectors first (all namespaces by default)
@@ -307,13 +294,19 @@ def ask(body: AskBody, authorization: Optional[str] = Header(default=None)) -> D
             "Cite titles/sources from context. If something is unclear or missing, say so."
         ),
     }
+
 # =========================
 # /fees endpoint (trading)
 # =========================
-from typing import Optional, List, Dict, Any
-from fastapi import Body
+class FeesBody(BaseModel):
+    file: Optional[str] = None
+    namespace: str = "trading"
+    query: str = "*"              # semantic “grab bag”; we’ll use a neutral embedding
+    top_k: int = 5000
+    start: Optional[str] = None   # "YYYY-MM-DD"
+    end: Optional[str] = None
+    symbols: Optional[List[str]] = None
 
-# ---------- FEES HELPERS ----------
 def _f(x) -> float:
     try:
         if x is None: return 0.0
@@ -345,18 +338,9 @@ def _pass_filters(md: Dict[str, Any],
             return False
     return True
 
-class FeesBody(BaseModel):
-    file: Optional[str] = None
-    namespace: str = "trading"
-    query: str = "*"              # semantic “grab bag”; we’ll use a neutral embedding
-    top_k: int = 5000
-    start: Optional[str] = None   # "YYYY-MM-DD"
-    end: Optional[str] = None
-    symbols: Optional[List[str]] = None
-
 @app.post("/fees")
-def fees(body: FeesBody):
-    _check_bearer(None)  # if you’re enforcing bearer here; otherwise remove
+def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
+    _check_bearer(authorization)
 
     # 1) Get a neutral embedding so we can pull lots of rows
     vec = embed_query("broker fee commission borrow overnight summary query")
@@ -385,7 +369,7 @@ def fees(body: FeesBody):
             continue
         rows_scanned += 1
 
-        # per-column fees if present (many rows won’t have these, that’s fine)
+        # per-column fees if present
         for k in fee_cols:
             by_col[k] += _f(md.get(k))
 
@@ -397,16 +381,15 @@ def fees(body: FeesBody):
         amt = _f(md.get("amount"))
         if ft == "borrow_fee":
             borrow_total += amt
-        elif ft == "overnight_fee":
+        elif ft in ("overnight_borrow_fee", "overnight_fee"):
             overnight_total += amt
 
     # 5) Build totals
     fee_cols_sum = sum(by_col.values())
-    # Grand total matches local script logic: fee columns + borrow + overnight.
-    # NOTE: If fee columns are zero (not embedded per-row), trades_fees_total covers trade fees.
     grand_total = fee_cols_sum + borrow_total + overnight_total
-    # Provide both, so you can compare:
-    combined_including_trades_rollup = grand_total + trades_fees_total if fee_cols_sum == 0.0 else grand_total
+    combined_including_trades_rollup = (
+        grand_total + trades_fees_total if fee_cols_sum == 0.0 else grand_total
+    )
 
     pretty = []
     pretty.append(f"Rows scanned: {rows_scanned}\n")
@@ -445,11 +428,10 @@ def fees(body: FeesBody):
         },
         "pretty": "\n".join(pretty),
     }
-from datetime import datetime
 
-from typing import Optional
-from fastapi import Header, HTTPException
-
+# =========================
+# /fees_summary endpoint
+# =========================
 @app.post("/fees_summary")
 def fees_summary(
     symbol: str,
@@ -467,7 +449,7 @@ def fees_summary(
     _check_bearer(authorization)
 
     ns = "trading"
-    q = f"{symbol} borrow fee"  # simple query key; index is already pre-tagged
+    q = f"{symbol} borrow fee"  # simple query; index is already pre-tagged
 
     # Build a vector from the query for semantic search
     vec = embed_query(q)
