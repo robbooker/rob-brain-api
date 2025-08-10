@@ -276,3 +276,154 @@ def ask(body: AskBody, authorization: Optional[str] = Header(default=None)) -> D
             "Cite titles/sources from context. If something is unclear or missing, say so."
         ),
     }
+# =========================
+# /fees endpoint (trading)
+# =========================
+from datetime import datetime
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+
+class FeesBody(BaseModel):
+    # Optional natural-language query to retrieve rows; default grabs broadly
+    query: Optional[str] = "*"
+    # How many rows to retrieve from Pinecone (use a big number to approximate "all")
+    top_k: int = 5000
+    # Namespace to search; your trading rows live here
+    namespace: str = "trading"
+    # Optional filters
+    start: Optional[str] = None   # "YYYY-MM-DD"
+    end: Optional[str] = None     # "YYYY-MM-DD"
+    symbols: Optional[List[str]] = None  # e.g. ["XPON","XBP"]
+
+def _parse_ymd(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except Exception:
+        return None
+
+def _num(x) -> float:
+    try:
+        if x is None:
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        # strip commas etc.
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return 0.0
+
+@app.post("/fees")
+def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    # Enforce bearer if you added _check_bearer previously; otherwise remove this line:
+    if "_check_bearer" in globals():
+        _check_bearer(authorization)
+
+    t0 = time.time()
+    # 1) Embed the query (broad "*" by default) and pull a big batch from Pinecone
+    vec = embed_query(body.query or "*")
+
+    try:
+        res = index.query(
+            vector=vec,
+            top_k=body.top_k,
+            namespace=body.namespace,
+            include_metadata=True,
+        )
+    except Exception as e:
+        logging.error(f"/fees Pinecone query failed: {e}")
+        raise HTTPException(status_code=500, detail="Vector query failed")
+
+    matches = getattr(res, "matches", []) or []
+
+    # 2) Optional filters
+    start_dt = _parse_ymd(body.start)
+    end_dt   = _parse_ymd(body.end)
+    want_symbols = set([s.upper() for s in (body.symbols or [])])
+
+    def _keep(md: Dict[str, Any]) -> bool:
+        # date filter
+        dstr = (md.get("date") or "").strip()
+        if start_dt or end_dt:
+            try:
+                ddt = datetime.strptime(dstr, "%Y-%m-%d")
+            except Exception:
+                return False
+            if start_dt and ddt < start_dt:
+                return False
+            if end_dt and ddt > end_dt:
+                return False
+        # symbol filter
+        if want_symbols:
+            sym = (md.get("symbol") or "").upper()
+            if sym not in want_symbols:
+                return False
+        return True
+
+    # 3) Aggregate
+    fee_cols = ["TransFee", "ECNTaker", "ECNMaker", "ORFFee", "TAFFee", "SECFee", "CATFee", "Commissions"]
+    totals: Dict[str, float] = {k: 0.0 for k in fee_cols}
+    borrow_total = 0.0
+    overnight_total = 0.0
+
+    rows_scanned = 0
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+        if not _keep(md):
+            continue
+        rows_scanned += 1
+
+        # Sum explicit fee columns if present
+        for k in fee_cols:
+            totals[k] += _num(md.get(k))
+
+        # Classify borrow vs overnight from description + amount
+        desc = (md.get("description") or md.get("text") or "").upper()
+        amt  = _num(md.get("amount"))
+        if "BORROW FEE" in desc:
+            # Your convention:
+            #  - contains " C "  -> borrow fee
+            #  - otherwise       -> overnight fee
+            if " C " in desc:
+                borrow_total += amt
+            else:
+                overnight_total += amt
+
+    fee_cols_total = sum(totals.values())
+    grand_total = fee_cols_total + borrow_total + overnight_total
+
+    took = time.time() - t0
+    logging.info(f"🧾 /fees scanned {rows_scanned} rows in {took:.3f}s "
+                 f"(fees={fee_cols_total:.2f}, borrow={borrow_total:.2f}, overnight={overnight_total:.2f})")
+
+    # 4) Return a structured JSON + pretty strings the GPT can render verbatim
+    pretty_lines = []
+    pretty_lines.append(f"Rows scanned: {rows_scanned}\n")
+    pretty_lines.append("--- Fee columns ---")
+    for k in fee_cols:
+        pretty_lines.append(f"{k:<10s}: ${totals[k]:.2f}")
+    pretty_lines.append(f"\nBorrow fees (from Amount, ' C STOCK BORROW FEE '): ${borrow_total:.2f}")
+    pretty_lines.append(f"Overnight fees (from Amount, 'STOCK BORROW FEE' no ' C '): ${overnight_total:.2f}")
+    pretty_lines.append("\n=== ALL-IN FEES & COMMISSIONS ===")
+    pretty_lines.append(f"${grand_total:.2f}")
+
+    return {
+        "ok": True,
+        "filters": {
+            "namespace": body.namespace,
+            "query": body.query,
+            "top_k": body.top_k,
+            "start": body.start,
+            "end": body.end,
+            "symbols": list(want_symbols) if want_symbols else None,
+        },
+        "rows_scanned": rows_scanned,
+        "totals": {
+            "by_column": {k: round(v, 2) for k, v in totals.items()},
+            "borrow_fees": round(borrow_total, 2),
+            "overnight_fees": round(overnight_total, 2),
+            "grand_total": round(grand_total, 2),
+        },
+        "pretty": "\n".join(pretty_lines),
+    }
