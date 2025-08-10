@@ -438,48 +438,22 @@ def fees_summary(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     top_k: int = 400,
-    brief: bool = False,                          # ← add this
+    brief: bool = False,   # parsed from query string: ?brief=true
     authorization: Optional[str] = Header(default=None)
 ):
-
-# build the base response
-    resp = {
-        "symbol": symbol.upper(),
-        "count": len(rows),
-        "totals": {
-            "borrow_fee_total": borrow_total,
-            "overnight_borrow_fee_total": overnight_total,
-            "grand_total": grand_total,
-        },
-        "daily_subtotals": daily,
-        "monthly_summary": {
-            "days_counted": days_counted,
-            "total": grand_total,
-            "avg_per_day": avg_per_day,
-            "max_day": max_day,
-        },
-    }
-
-    # only include the raw rows when NOT in brief mode
-    if not brief:
-        resp["rows"] = rows
-
-    return resp
     """
     Summarize borrow-related fees for a symbol in a date range.
-    - Returns split totals (borrow vs overnight), grand total
+    - Returns split totals (borrow vs overnight) and grand total
     - Daily subtotals (date -> total)
     - Monthly rollup (days_counted, total, avg_per_day, max_day)
     """
     _check_bearer(authorization)
 
     ns = "trading"
-    q = f"{symbol} borrow fee"  # simple query; index is already pre-tagged
+    q = f"{symbol} borrow fee"
 
-    # Build a vector from the query for semantic search
+    # 1) Embed + query Pinecone
     vec = embed_query(q)
-
-    # Query Pinecone
     res = index.query(
         vector=vec,
         top_k=top_k,
@@ -488,7 +462,7 @@ def fees_summary(
     )
     matches = getattr(res, "matches", []) or []
 
-    # Filter to rows for this symbol + in date range + with a borrow-fee type
+    # 2) Filter rows (symbol + date range + fee type)
     def in_range(dstr: str) -> bool:
         if not (start_date or end_date):
             return True
@@ -518,17 +492,15 @@ def fees_summary(
             "score": float(getattr(m, "score", 0.0) or 0.0),
         })
 
-    # Totals split by fee type
+    # 3) Totals & rollups
     borrow_total = sum(r["amount"] for r in rows if r["fee_type"] == "borrow_fee")
     overnight_total = sum(r["amount"] for r in rows if r["fee_type"] == "overnight_borrow_fee")
     grand_total = borrow_total + overnight_total
 
-    # Daily subtotals (over rows we actually kept)
     daily: Dict[str, float] = {}
     for r in rows:
         daily[r["date"]] = daily.get(r["date"], 0.0) + r["amount"]
 
-    # Monthly rollup over the counted days
     days_counted = len(daily)
     avg_per_day = (grand_total / days_counted) if days_counted else 0.0
     if daily:
@@ -537,7 +509,7 @@ def fees_summary(
     else:
         max_day = {"date": None, "total": 0.0}
 
-        # Build compact response first
+    # 4) Build response once
     resp = {
         "symbol": symbol.upper(),
         "count": len(rows),
