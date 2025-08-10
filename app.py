@@ -8,6 +8,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Query
 from pydantic import BaseModel
 
+# add near your other imports
+from typing import Optional, List
+from pydantic import BaseModel
+
+# === Request body model for /fees ===
+class FeesBody(BaseModel):
+    file: Optional[str] = None
+    namespace: str = "trading"
+    query: str = "*"
+    top_k: int = 5000
+    start: Optional[str] = None
+    end: Optional[str] = None
+    symbols: Optional[List[str]] = None
+
 from openai import OpenAI
 from pinecone import Pinecone
 from datetime import datetime
