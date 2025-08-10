@@ -482,14 +482,23 @@ def fees_rollup(
     }
 
 # ==== /short_pnl (new) ====
+
+
 @app.post("/short_pnl")
 def short_pnl(
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str]   = Query(None),
-    top_k: int                = Query(5000),
-    file: Optional[str]       = Query(None),
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
+    top_k: int                = Query(5000, description="How many rows to scan"),
+    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
     authorization: Optional[str] = Header(default=None),
 ):
+    """
+    Realized P&L for SHORT trades over a date window (FIFO):
+    - Uses vector rows where Type == SHORT, qty != 0, symbol != MARKET
+    - qty < 0 = open short (sell); qty > 0 = cover (buy)
+    - PnL = (open_price - cover_price) * matched_shares
+    - Returns realized PnL by symbol and any open lots still outstanding
+    """
     _check_bearer(authorization)
 
     start_dt = _parse_any_date(start_date) if start_date else None
@@ -501,115 +510,132 @@ def short_pnl(
         d = _parse_any_date(dstr)
         if not d:
             return False
-        if start_dt and d < start_dt: return False
-        if end_dt   and d > end_dt:   return False
+        if start_dt and d < start_dt:
+            return False
+        if end_dt and d > end_dt:
+            return False
         return True
 
-    try:
-        ns = "trading"
-        vec = embed_query("broker activity trades short sell buy quantity price realized pnl")
-        res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
-        matches = getattr(res, "matches", []) or []
+    ns = "trading"
+    vec = embed_query("Type SHORT short trades sell buy cover quantity price FIFO PnL")
+    res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
+    matches = getattr(res, "matches", []) or []
 
-        rows_scanned = 0
-        open_lots: Dict[str, List[Dict[str, float]]] = {}
-        realized_by_symbol: Dict[str, float] = {}
-        trades_used = 0
+    # Per-symbol FIFO open lots: list of dicts {shares:int, price:float, date:str}
+    open_lots: Dict[str, List[Dict[str, Any]]] = {}
+    realized_by_symbol: Dict[str, float] = {}
+    rows_scanned = 0
+    trades_used = 0
 
-        def pick(md, *keys, default=None):
-            for k in keys:
-                if k in md and md[k] not in (None, ""):
-                    return md[k]
-            return default
-
-        for m in matches:
-            md = getattr(m, "metadata", {}) or {}
-            if file and str(md.get("file", "")).strip() != file.strip():
-                continue
-            if not in_range(str(md.get("date", ""))):
-                continue
-
-            typ = str(pick(md, "Type", "type")).strip().lower()
-            if typ != "short":
-                continue
-
-            side = str(pick(md, "B/S", "BS", "b_s", "Side", "side")).strip().lower()
-            if side not in ("sell", "buy"):
-                continue
-
-            sym = str(pick(md, "symbol", "Symbol", "SYM")).strip().upper()
-            if not sym:
-                continue
-
-            qty_raw = pick(md, "Quantity", "Qty", "Shares", "quantity", "qty", default=0)
-            try:
-                q = float(str(qty_raw).replace(",", ""))
-            except Exception:
-                continue
-            shares = abs(q)
-            if shares <= 0:
-                continue
-
-            price_raw = pick(md, "Price", "FillPrice", "Fill", "price", default=None)
-            if price_raw is None:
+    def get_num(*vals, default=0.0):
+        for v in vals:
+            if v is None:
                 continue
             try:
-                price = float(str(price_raw).replace(",", ""))
+                # handle strings like "-3,000"
+                if isinstance(v, str):
+                    v = v.replace(",", "").strip()
+                return float(v)
             except Exception:
-                continue
+                pass
+        return float(default)
 
-            rows_scanned += 1
+    for m in matches:
+        md = (getattr(m, "metadata", {}) or {})
+        # Optional: restrict to a specific uploaded CSV
+        if file and str(md.get("file", "")).strip() != file.strip():
+            continue
+
+        # Date filter
+        dstr = str(md.get("date", "")).strip()
+        if not dstr or not in_range(dstr):
+            continue
+
+        # Type must be SHORT
+        tval = (md.get("Type") or md.get("type") or "").strip().upper()
+        if tval != "SHORT":
+            continue
+
+        # Symbol present and not MARKET
+        sym = (md.get("symbol") or md.get("Symbol") or "").strip().upper()
+        if not sym or sym == "MARKET":
+            continue
+
+        # Quantity and Price
+        qty = get_num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"))
+        if qty == 0:
+            continue
+        price = get_num(md.get("Price"), md.get("price"))
+        if price == 0:
+            # skip rows without a usable price
+            continue
+
+        rows_scanned += 1
+
+        # Initialize symbol buckets
+        if sym not in open_lots:
+            open_lots[sym] = []
+        if sym not in realized_by_symbol:
+            realized_by_symbol[sym] = 0.0
+
+        if qty < 0:
+            # Open short: store positive share count for convenience
+            open_lots[sym].append({
+                "shares": int(abs(qty)),
+                "price": float(price),
+                "date": dstr,
+            })
+            trades_used += 1
+        else:
+            # Cover: FIFO match against open lots
+            cover = int(qty)
             trades_used += 1
 
-            if side == "sell":
-                open_lots.setdefault(sym, []).append({"shares": shares, "price": price})
-            else:
-                remaining = shares
-                lots = open_lots.get(sym, [])
-                while remaining > 0 and lots:
-                    lot = lots[0]
-                    take = min(remaining, lot["shares"])
-                    pnl = (lot["price"] - price) * take  # short pnl
-                    realized_by_symbol[sym] = realized_by_symbol.get(sym, 0.0) + pnl
-                    lot["shares"] -= take
-                    remaining -= take
-                    if lot["shares"] <= 1e-9:
-                        lots.pop(0)
+            lots = open_lots[sym]
+            i = 0
+            while cover > 0 and i < len(lots):
+                lot = lots[i]
+                match_shares = min(cover, lot["shares"])
+                # Short PnL = (open - cover) * shares
+                pnl = (lot["price"] - price) * match_shares
+                realized_by_symbol[sym] += pnl
 
-        by_symbol = [{"symbol": s, "realized_pnl": round(v, 2)} for s, v in realized_by_symbol.items()]
-        by_symbol.sort(key=lambda x: x["realized_pnl"], reverse=True)
-        total_realized = round(sum(x["realized_pnl"] for x in by_symbol), 2)
+                lot["shares"] -= match_shares
+                cover -= match_shares
+                if lot["shares"] == 0:
+                    lots.pop(i)
+                else:
+                    i += 1
 
-        open_short_shares = {
-            s: round(sum(l["shares"] for l in lots), 2)
-            for s, lots in open_lots.items() if lots
-        }
+            # If cover > 0 here, we had an unmatched cover (no open lot). Ignore or log.
 
-        return {
-            "ok": True,
-            "filters": {
-                "start_date": start_date,
-                "end_date": end_date,
-                "top_k": top_k,
-                "file": file,
-                "namespace": ns,
-            },
-            "rows_scanned": rows_scanned,
-            "trades_used": trades_used,
-            "realized_by_symbol": by_symbol,
-            "total_realized_pnl": total_realized,
-            "open_short_shares_by_symbol": open_short_shares,
-        }
+    # Prepare outputs
+    realized_list = [
+        {"symbol": s, "realized_pnl": round(v, 2)}
+        for s, v in realized_by_symbol.items()
+        if abs(v) > 1e-9
+    ]
+    realized_list.sort(key=lambda x: x["realized_pnl"], reverse=True)
 
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": "short_pnl_failed",
-            "message": str(e),
-            "filters": {
-                "start_date": start_date,
-                "end_date": end_date,
-                "top_k": top_k,
-                "file": file,
-            },
-        }
+    total_realized = round(sum(x["realized_pnl"] for x in realized_list), 2)
+
+    open_short_shares_by_symbol = {
+        s: sum(lot["shares"] for lot in lots) for s, lots in open_lots.items()
+        if sum(lot["shares"] for lot in lots) != 0
+    }
+
+    return {
+        "ok": True,
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "top_k": top_k,
+            "file": file,
+            "namespace": ns
+        },
+        "rows_scanned": rows_scanned,
+        "trades_used": trades_used,
+        "realized_by_symbol": realized_list,
+        "total_realized_pnl": total_realized,
+        "open_short_shares_by_symbol": open_short_shares_by_symbol,
+    }
