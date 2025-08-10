@@ -224,117 +224,67 @@ def search(body: SearchBody, authorization: Optional[str] = Header(default=None)
 # =========================
 # /ask endpoint
 # =========================
-import os
-from typing import Optional, List, Dict, Any
 
-# Hard caps so Actions / the model input doesn’t blow up
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "120000"))  # ~120 KB total
-MAX_EXCERPT_CHARS = int(os.getenv("MAX_EXCERPT_CHARS", "1500"))    # per hit
-MIN_SCORE_DEFAULT = float(os.getenv("ASK_MIN_SCORE_DEFAULT", "0.34"))
-
-class AskBody(BaseModel):
-    question: str
-    top_k: int = 12
-    namespace: Optional[str] = None
-    min_score: Optional[float] = None
-    symbols: Optional[List[str]] = None
-    tags: Optional[List[str]] = None
-
-
-@app.post("/ask", summary="Ask", description=(
-    "Orchestrated endpoint for your GPT:\n"
-    "  1) Always search vectors first (all namespaces by default)\n"
-    "  2) If strong hits exist (>= min_score), return them as context\n"
-    "  3) Otherwise return use_web=true so GPT falls back to web search"
-))
+@app.post("/ask")
 def ask(
     body: AskBody,
     authorization: Optional[str] = Header(default=None),
 ):
+    """
+    Orchestrated endpoint for your GPT:
+      1) Always search vectors first (all namespaces by default)
+      2) If strong hits exist (>= min_score), return them as context
+      3) Otherwise return use_web=true so GPT falls back to web search
+    """
     _check_bearer(authorization)
 
-    question = body.question.strip()
-    if not question:
-        return {
-            "answered_from": None,
-            "use_web": True,
-            "reason": "Empty question",
-            "context": [],
-            "hits_count": 0,
-            "namespaces_queried": [],
-            "min_score_used": body.min_score or MIN_SCORE_DEFAULT,
-            "suggested_instruction": "Please provide a question."
-        }
+    ns = body.namespace or "all"
+    min_score = body.min_score or 0.34
+    top_k = body.top_k or 12
 
-    # Decide which namespaces to query
-    want_all = body.namespace is None or str(body.namespace).lower() in ("", "all", "any")
-    if want_all:
-        # If you maintain a dynamic list elsewhere, swap this for that call.
-        namespaces = ["nonfiction", "trading"]
-    else:
-        namespaces = [body.namespace]
+    # Step 1: search vectors
+    search_body = {
+        "query": body.question,
+        "top_k": top_k,
+    }
+    if ns != "all":
+        search_body["namespace"] = ns
+    if body.symbols:
+        search_body["symbols"] = body.symbols
+    if body.tags:
+        search_body["tags"] = body.tags
 
-    min_score = float(body.min_score) if body.min_score is not None else MIN_SCORE_DEFAULT
-    top_k = int(body.top_k or 12)
+    res = index.query(
+        vector=embed_query(body.question),
+        top_k=top_k,
+        namespace=None if ns == "all" else ns,
+        include_metadata=True,
+    )
 
-    # Build query embedding once
-    qvec = embed_query(question)
+    matches = getattr(res, "matches", []) or []
 
-    # Collect matches across namespaces
-    combined: List[Any] = []
-    for ns in namespaces:
-        try:
-            res = index.query(
-                vector=qvec,
-                top_k=top_k,
-                namespace=ns,
-                include_metadata=True,
-            )
-            for m in getattr(res, "matches", []) or []:
-                # attach the ns so we can echo it back
-                if getattr(m, "metadata", None) is None:
-                    m.metadata = {}
-                m.metadata["namespace"] = ns
-                combined.append(m)
-        except Exception as e:
-            # If an index/namespace is missing, just skip it
-            continue
+    # Filter strong hits
+    strong_hits = [m for m in matches if getattr(m, "score", 0.0) >= min_score]
 
-    # Optional metadata filters
-    sym_filter = set([s.upper() for s in (body.symbols or [])])
-    tag_filter = set([t.lower() for t in (body.tags or [])])
+    # Caps
+    MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "120000"))  # total chars
+    MAX_EXCERPT_CHARS = int(os.getenv("MAX_EXCERPT_CHARS", "1500"))    # per hit
+    MAX_CONTEXT_ITEMS = int(os.getenv("MAX_CONTEXT_ITEMS", "200"))     # max items
 
-    def passes_filters(md: Dict[str, Any]) -> bool:
-        if sym_filter:
-            sym = str(md.get("symbol", "")).upper()
-            if sym not in sym_filter:
-                return False
-        if tag_filter:
-            md_tags = md.get("tags") or []
-            try:
-                md_tags_norm = set([str(t).lower() for t in md_tags])
-            except Exception:
-                md_tags_norm = set()
-            if not (md_tags_norm & tag_filter):
-                return False
-        return True
-
-    # Keep only sufficiently strong hits that pass filters
-    strong_hits: List[Any] = []
-    for m in combined:
-        sc = float(getattr(m, "score", 0.0) or 0.0)
-        md = getattr(m, "metadata", {}) or {}
-        if sc >= min_score and passes_filters(md):
-            strong_hits.append(m)
-
-    # Sort strongest first (descending score)
-    strong_hits.sort(key=lambda x: float(getattr(x, "score", 0.0) or 0.0), reverse=True)
-
-    # Build bounded context (cap total chars and trim each excerpt)
     context: List[Dict[str, Any]] = []
     total_chars = 0
+    seen_keys = set()  # dedupe by (title, source)
+
     for m in strong_hits:
+        if len(context) >= MAX_CONTEXT_ITEMS:
+            break
+
         md = getattr(m, "metadata", {}) or {}
+        k = (md.get("title") or "", md.get("source") or "")
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+
         txt = (md.get("text") or "")
         if txt and len(txt) > MAX_EXCERPT_CHARS:
             txt = txt[:MAX_EXCERPT_CHARS] + "…"
@@ -352,22 +302,29 @@ def ask(
         })
         total_chars += add_len
 
-    use_web = len(context) == 0
+    # Step 2: if no strong hits, fallback
+    if not context:
+        return {
+            "answered_from": "none",
+            "use_web": True,
+            "min_score_used": min_score,
+            "namespaces_queried": [ns],
+            "hits_count": 0,
+            "context": [],
+            "suggested_instruction": "No strong vector hits found — fall back to web search."
+        }
 
+    # Step 3: return results
     return {
-        "answered_from": "vector" if not use_web else None,
-        "use_web": use_web,
+        "answered_from": "vector",
+        "use_web": False,
         "min_score_used": min_score,
-        "namespaces_queried": namespaces,
-        "hits_count": len(context),
+        "namespaces_queried": [ns],
+        "hits_count": len(strong_hits),
         "context": context,
-        "suggested_instruction": (
-            "Use the context excerpts to answer the user's question. "
-            "Cite titles/sources from context. If something is unclear or missing, say so."
-            if not use_web else
-            "No strong vector hits; please use web search to answer."
-        ),
+        "suggested_instruction": "Use the context excerpts to answer the user's question. Cite titles/sources from context. If something is unclear or missing, say so."
     }
+
 # =========================
 # /fees endpoint (auto‑chunking)
 # =========================
