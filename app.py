@@ -17,6 +17,22 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_INDEX = os.environ.get("PINECONE_INDEX", "rob-brain")
 
+EMBED_MODEL = "text-embedding-3-large"
+
+# ---- Bearer auth for Actions ----
+FOREVER_BRAIN_BEARER = os.environ.get("FOREVER_BRAIN_BEARER")
+
+def _check_bearer(authorization_header: str | None):
+    """Raise 401 if the Authorization header is missing/invalid."""
+    if not FOREVER_BRAIN_BEARER:
+        # If you forgot to set it on Render, fail closed.
+        raise HTTPException(status_code=500, detail="Server missing bearer key")
+    if not authorization_header or not authorization_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token = authorization_header.split(" ", 1)[1].strip()
+    if token != FOREVER_BRAIN_BEARER:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
 if not PINECONE_API_KEY:
@@ -112,6 +128,7 @@ def healthz():
 
 @app.post("/search")
 def search(body: SearchBody, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _check_bearer(authorization)   # ← add this line
     """
     Legacy search (kept for compatibility).
     If body.namespace is None or 'all', search ALL namespaces and combine results.
@@ -169,6 +186,7 @@ def search(body: SearchBody, authorization: Optional[str] = Header(default=None)
 
 @app.post("/ask")
 def ask(body: AskBody, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _check_bearer(authorization)   # ← add this line
     """
     Orchestrated endpoint for your GPT:
       1) Always search vectors first (all namespaces by default)
