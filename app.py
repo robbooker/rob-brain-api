@@ -1,174 +1,165 @@
-# app.py — Rob’s Forever Brain API
-# Namespaces: fiction, nonfiction, trading, personal, reference
-# Default behavior: searches ALL namespaces unless one is explicitly provided.
+import os
+import time
+import logging
+from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import os
 
 from openai import OpenAI
 from pinecone import Pinecone
 
-# ---------- Config ----------
+# -----------------------------------------------------------------------------
+# Config & clients
+# -----------------------------------------------------------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_INDEX = os.environ.get("PINECONE_INDEX", "rob-brain")
-BEARER_TOKEN    = os.environ.get("FOREVER_BRAIN_BEARER")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY in environment.")
+    raise RuntimeError("Missing OPENAI_API_KEY")
 if not PINECONE_API_KEY:
-    raise RuntimeError("Missing PINECONE_API_KEY in environment.")
-if not BEARER_TOKEN:
-    raise RuntimeError("Missing FOREVER_BRAIN_BEARER in environment.")
+    raise RuntimeError("Missing PINECONE_API_KEY")
 
-# Permanent namespace set
-NAMESPACES = ["fiction", "nonfiction", "trading", "personal", "reference"]
+# OpenAI
+oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- Clients ----------
-# Use env var for OpenAI key; no proxies arg.
-oai = OpenAI()
-pc  = Pinecone(api_key=PINECONE_API_KEY)
+# Pinecone
+pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
 
-# ---------- App ----------
-app = FastAPI(
-    title="Rob Forever Brain API",
-    version="2.0.0",
-    servers=[{"url": "https://rob-brain-api.onrender.com", "description": "Live server"}],
-)
+# Namespaces we use
+ALL_NAMESPACES = ["fiction", "nonfiction", "trading", "personal", "reference"]
 
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Rob Forever Brain API", version="2.0.0")
+
+# Allow calls from your GPT/action UI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ---------- Models ----------
-class DateRange(BaseModel):
-    start: Optional[str] = None  # "YYYY-MM-DD"
-    end: Optional[str] = None
-
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
 class SearchBody(BaseModel):
     query: str
-    top_k: int = 12
-    namespace: Optional[str] = None   # omit or "" => search all
+    top_k: int = 8
+    namespace: Optional[str] = None   # None or "all" -> search every namespace
     symbols: Optional[List[str]] = None
     tags: Optional[List[str]] = None
-    date_range: Optional[DateRange] = None
 
-# ---------- Auth ----------
-def require_bearer(authorization: Optional[str] = Header(default=None, alias="Authorization")):
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.split(" ", 1)[1].strip()
-    if token != BEARER_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid bearer token")
-    return True
 
-# ---------- Soft keyword nudges per namespace ----------
-KW_BY_NS = {
-    "fiction": [
-        "character", "narrative", "plot", "chapter", "novel", "story", "dialogue", "scene"
-    ],
-    "nonfiction": [
-        "munger", "charlie munger", "paul graham", "marcus aurelius", "meditations",
-        "stoic", "stoicism", "bias", "checklist", "opportunity cost", "decision",
-        "virtue", "prudence", "discipline"
-    ],
-    "trading": [
-        "short", "borrow", "fee", "ssr", "halt", "float", "dilution", "offering",
-        "pnl", "profit", "loss", "gap", "fade", "resistance", "support", "liquidity",
-        "ticker", "10q", "8k", "shelf", "at-the-market"
-    ],
-    "personal": [
-        "journal", "reflection", "lesson", "goal", "plan", "review", "gratitude",
-        "habit", "routine", "mood", "relationship"
-    ],
-    "reference": [
-        "definition", "glossary", "table", "appendix", "dataset", "reference",
-        "api", "specification", "manual", "guide"
-    ],
-}
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def embed_query(text: str) -> List[float]:
+    """Return an embedding vector for a query."""
+    t0 = time.time()
+    resp = oai.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    vec = resp.data[0].embedding
+    logging.info(f"🧠 Embed time: {time.time() - t0:.3f}s (dim={len(vec)})")
+    return vec
 
-def _keywords_for(ns: Optional[str]) -> List[str]:
-    return KW_BY_NS.get((ns or "").lower(), [])
 
-def _kw_hits(text: str, keywords: List[str]) -> int:
-    t = (text or "").lower()
-    return sum(1 for k in keywords if k in t)
+def list_namespaces() -> List[str]:
+    """Return namespaces present in the index."""
+    try:
+        stats = index.describe_index_stats()
+        # 'namespaces' may be a dict of namespace->stats; fall back to ALL_NAMESPACES
+        ns = sorted(list(stats.get("namespaces", {}).keys()))
+        return ns if ns else ALL_NAMESPACES
+    except Exception as e:
+        logging.error(f"describe_index_stats failed: {e}")
+        return ALL_NAMESPACES
 
-# ---------- Routes ----------
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "index": PINECONE_INDEX, "namespaces": NAMESPACES}
+    """Basic health + what namespaces exist right now."""
+    return {
+        "ok": True,
+        "index": PINECONE_INDEX,
+        "namespaces": list_namespaces(),
+    }
+
 
 @app.post("/search")
-def search(body: SearchBody, _: bool = Depends(require_bearer)):
+def search(body: SearchBody, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     """
-    If body.namespace is empty: search ALL namespaces and merge.
-    If body.namespace is provided (e.g., "trading"), search only that one.
+    Search Pinecone.
+    - If body.namespace is None or 'all', search ALL namespaces and combine results.
+    - Otherwise search just the provided namespace.
     """
-    # 1) Embed the query
-    emb = oai.embeddings.create(
-        model="text-embedding-3-large",
-        input=body.query
-    ).data[0].embedding
+    # Decide namespaces
+    if body.namespace and body.namespace != "all":
+        namespaces_to_use = [body.namespace]
+    else:
+        namespaces_to_use = ALL_NAMESPACES
 
-    # 2) Optional metadata filters
-    flt: Dict[str, Any] = {}
-    if body.symbols:
-        flt["symbol"] = {"$in": body.symbols}
-    if body.tags:
-        flt["tags"] = {"$in": body.tags}
-    if body.date_range and (body.date_range.start or body.date_range.end):
-        rng: Dict[str, Any] = {}
-        if body.date_range.start:
-            rng["$gte"] = body.date_range.start
-        if body.date_range.end:
-            rng["$lte"] = body.date_range.end
-        flt["date"] = rng
-    flt = flt or None
+    # Log incoming request
+    logging.info("🔍 Search request received")
+    logging.info(f"Query: {body.query}")
+    logging.info(f"Namespaces searched: {namespaces_to_use}")
+    logging.info(f"Top K per namespace: {body.top_k}")
 
-    # 3) Which namespaces to hit? (blank => all)
-    ns_param = (body.namespace or "").strip().lower()
-    namespaces = NAMESPACES if not ns_param else [ns_param]
+    # Embed once
+    vec = embed_query(body.query)
 
-    # 4) Query each namespace, slightly over-fetch, then merge + rerank
-    per_ns_k = max(min(body.top_k, 12), 6)  # 6..12 per namespace
-    all_matches: List[Dict[str, Any]] = []
+    # Query each namespace
+    combined_results: List[Dict[str, Any]] = []
+    for ns in namespaces_to_use:
+        try:
+            t0 = time.time()
+            res = index.query(
+                vector=vec,
+                top_k=body.top_k,
+                namespace=ns,
+                include_metadata=True,
+            )
+            took = time.time() - t0
+            matches = getattr(res, "matches", []) or []
+            logging.info(f"📦 Namespace '{ns}' returned {len(matches)} results in {took:.3f}s")
 
-    for ns in namespaces:
-        res = index.query(
-            vector=emb,
-            top_k=per_ns_k,
-            include_metadata=True,
-            namespace=ns,
-            filter=flt,
-        )
-        matches = res.get("matches") or []
-        kws = _keywords_for(ns)
-        for m in matches:
-            md = m.get("metadata", {}) or {}
-            txt = f"{md.get('text','')} {md.get('title','')}"
-            base = float(m.get("score") or 0.0)
-            add = 0.05 * _kw_hits(txt, kws)  # gentle nudge
-            all_matches.append({
-                "namespace": ns,
-                "text": md.get("text", ""),
-                "metadata": md,
-                "score": base,
-                "combined": base + add
-            })
+            # Normalize match objects to plain dicts the GPT can read easily
+            for m in matches:
+                md = getattr(m, "metadata", {}) or {}
+                combined_results.append({
+                    "namespace": ns,
+                    "id": getattr(m, "id", None),
+                    "score": getattr(m, "score", None),
+                    "text": md.get("text"),
+                    "metadata": md,
+                })
 
-    # 5) Merge, sort, trim
-    all_matches.sort(key=lambda x: x["combined"], reverse=True)
-    hits = all_matches[: body.top_k]
+        except Exception as e:
+            logging.error(f"❌ Error searching namespace '{ns}': {e}")
+
+    # Optional: quick peek at the first 3 snippets in logs
+    for i, hit in enumerate(combined_results[:3]):
+        snippet = (hit.get("text") or "")[:160].replace("\n", " ")
+        logging.info(f"▶ Hit {i+1} [{hit.get('namespace')}:{hit.get('score')}] {snippet!r}")
+
+    logging.info(f"✅ Total combined results: {len(combined_results)}")
 
     return {
-        "namespaces_queried": namespaces,
-        "hits": hits,
-        "count": len(hits)
+        "namespaces_queried": namespaces_to_use,
+        "hits": combined_results,
+        "count": len(combined_results),
     }
