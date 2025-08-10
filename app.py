@@ -611,7 +611,7 @@ def fees_rollup(
         if not sym:
             continue  # skip rows that don't have a symbol
 
-        amt = float(md.get("amount") or 0.0)
+        amt = _f(md.get("amount"))
 
         per_symbol[sym] = per_symbol.get(sym, 0.0) + amt
         grand_total += amt
