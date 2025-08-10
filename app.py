@@ -88,6 +88,25 @@ class AskBody(BaseModel):
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+from datetime import datetime
+
+def _norm_date(s: str) -> str:
+    """Return YYYY-MM-DD for mixed date strings like '7/9/2025' or '2025-07-09'."""
+    if not s:
+        return s
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%-m/%-d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # macOS strptime may not support %-m; try zero-padded as last resort
+    for fmt in ("%m/%d/%Y",):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return s
+    
 from datetime import datetime, date
 
 def _parse_any_date(s: str):
@@ -437,92 +456,94 @@ def fees_summary(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     top_k: int = 400,
-    authorization: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None)
 ):
     """
-    Summarize borrow/overnight fees for a single symbol within an optional date range.
-    Accepts POST with query-string params, e.g.:
-      /fees_summary?symbol=NDRA&start_date=2025-07-01&end_date=2025-07-31&top_k=400
+    Summarize borrow-related fees for a symbol in a date range.
+    - Returns split totals (borrow vs overnight), grand total
+    - Daily subtotals (date -> total)
+    - Monthly rollup (days_counted, total, avg_per_day, max_day)
     """
     _check_bearer(authorization)
 
-    # --- parse dates strictly to date objects ---
-    start_d = _parse_any_date(start_date) if start_date else None
-    end_d   = _parse_any_date(end_date) if end_date else None
+    ns = "trading"
+    q = f"{symbol} borrow fee"  # simple query key; index is already pre-tagged
 
-    # --- build the query text and embed once ---
-    qtext = f"{symbol} borrow fee"
-    vec = embed_query(qtext)
+    # Build a vector from the query for semantic search
+    vec = embed_query(q)
 
-    # --- query the 'trading' namespace only (fee records live there) ---
+    # Query Pinecone
     res = index.query(
         vector=vec,
-        top_k=min(max(top_k, 50), 500),   # clamp a bit, 50..500
-        namespace="trading",
+        top_k=top_k,
+        namespace=ns,
         include_metadata=True,
     )
-
-    total = 0.0
-    rows  = []
-
-    # --- walk matches and apply strict date filtering ---
     matches = getattr(res, "matches", []) or []
+
+    # Filter to rows for this symbol + in date range + with a borrow-fee type
+    def in_range(dstr: str) -> bool:
+        if not (start_date or end_date):
+            return True
+        nd = _norm_date(dstr)
+        if start_date and nd < start_date:
+            return False
+        if end_date and nd > end_date:
+            return False
+        return True
+
+    rows: List[Dict[str, Any]] = []
     for m in matches:
-        md = getattr(m, "metadata", {}) or {}
-        # symbol filter (case-insensitive exact ticker match)
-        sym = (md.get("symbol") or "").upper()
-        if sym != symbol.upper():
+        md = (getattr(m, "metadata", None) or {})
+        if (md.get("symbol") or "").upper() != symbol.upper():
             continue
-
-        # parse and filter by date
-        dstr = md.get("date") or ""              # can be "2025-07-09" or "7/9/2025"
-        dobj = _parse_any_date(dstr)
-        if not dobj:
+        ft = (md.get("fee_type") or "").lower()
+        if ft not in ("borrow_fee", "overnight_borrow_fee"):
             continue
-        if start_d and dobj < start_d:
+        dstr = md.get("date") or ""
+        if not in_range(dstr):
             continue
-        if end_d and dobj > end_d:
-            continue
-
-        # amount (as number)
-        amt = md.get("amount")
-        try:
-            amt = float(0 if amt in (None, "") else amt)
-        except Exception:
-            continue
-
-        # only borrow-related fees (carry and overnight)
-        fee_type = (md.get("fee_type") or "").strip()
-        desc = (md.get("description") or "")
-        if not fee_type:
-            # light fallback classifier if fee_type missing
-            U = desc.upper()
-            if "BORROW FEE" in U and " C " in U:
-                fee_type = "borrow_fee"
-            elif "BORROW FEE" in U:
-                fee_type = "overnight_borrow_fee"
-            else:
-                # not a borrow fee → skip
-                continue
-
-        if fee_type not in ("borrow_fee", "overnight_borrow_fee"):
-            continue
-
-        total += amt
         rows.append({
-            "date": dobj.isoformat(),
-            "amount": amt,
-            "description": desc,
-            "fee_type": fee_type,
-            "score": getattr(m, "score", None),
+            "date": _norm_date(dstr),
+            "amount": float(md.get("amount", 0.0)),
+            "description": md.get("description") or "",
+            "fee_type": ft,
+            "score": float(getattr(m, "score", 0.0) or 0.0),
         })
 
-    # sort rows by date (oldest → newest)
-    rows.sort(key=lambda r: r["date"])
+    # Totals split by fee type
+    borrow_total = sum(r["amount"] for r in rows if r["fee_type"] == "borrow_fee")
+    overnight_total = sum(r["amount"] for r in rows if r["fee_type"] == "overnight_borrow_fee")
+    grand_total = borrow_total + overnight_total
+
+    # Daily subtotals (over rows we actually kept)
+    daily: Dict[str, float] = {}
+    for r in rows:
+        daily[r["date"]] = daily.get(r["date"], 0.0) + r["amount"]
+
+    # Monthly rollup over the counted days
+    days_counted = len(daily)
+    avg_per_day = (grand_total / days_counted) if days_counted else 0.0
+    if daily:
+        max_day_date = max(daily, key=lambda d: daily[d])
+        max_day = {"date": max_day_date, "total": daily[max_day_date]}
+    else:
+        max_day = {"date": None, "total": 0.0}
 
     return {
         "symbol": symbol.upper(),
-        "total": total,
         "count": len(rows),
-        "rows": rows,
+        "totals": {
+            "borrow_fee_total": borrow_total,
+            "overnight_borrow_fee_total": overnight_total,
+            "grand_total": grand_total,
+        },
+        "daily_subtotals": daily,         # { 'YYYY-MM-DD': total }
+        "monthly_summary": {
+            "days_counted": days_counted,
+            "total": grand_total,
+            "avg_per_day": avg_per_day,
+            "max_day": max_day,
+        },
+        "rows": rows,  # still include raw rows for transparency
     }
