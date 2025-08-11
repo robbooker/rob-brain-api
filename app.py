@@ -22,23 +22,6 @@ def embed_query(text: str) -> List[float]:
     resp = client.embeddings.create(model=EMBED_MODEL, input=text)
     return resp.data[0].embedding
 
-from fastapi.openapi.utils import get_openapi
-
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description if hasattr(app, "description") else "",
-        routes=app.routes,
-    )
-    schema["servers"] = [{"url": "https://rob-brain-api.onrender.com", "description": "prod"}]
-    app.openapi_schema = schema
-    return app.openapi_schema
-
-app.openapi = custom_openapi  # <-- register the custom schema
-
 # ==== INDEX SETUP (swap for your existing one if different) ====
 # We expect a vector index client with .query(vector, top_k, namespace, include_metadata=True)
 # and optionally .describe_index_stats() for healthz. Replace with your known-good code if needed.
