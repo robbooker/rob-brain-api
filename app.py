@@ -31,7 +31,7 @@ INDEX_NAME = os.getenv("PINECONE_INDEX", "rob-brain")
 index = pc.Index(INDEX_NAME)
 
 # ==== FastAPI ====
-app = FastAPI(title="Rob Forever Brain API", version="2.2.3")
+app = FastAPI(title="Rob Forever Brain API", version="2.2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -662,6 +662,26 @@ def short_pnl(
         "total_realized_pnl": total_realized,
         "open_short_shares_by_symbol": open_short_shares_by_symbol,
     }
+
+# --- keep your existing POST /short_pnl exactly as-is ---
+
+# GET alias so tools that prefer GET can call it via query params
+@app.get("/short_pnl")
+def short_pnl_get(
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str]   = Query(None),
+    top_k: int                = Query(5000),
+    file: Optional[str]       = Query(None),
+    authorization: Optional[str] = Header(default=None),
+):
+    # Reuse the same implementation by calling the POST handler
+    return short_pnl(
+        start_date=start_date,
+        end_date=end_date,
+        top_k=top_k,
+        file=file,
+        authorization=authorization,
+    )
 
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
 
