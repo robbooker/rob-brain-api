@@ -636,12 +636,19 @@ def _short_pnl_core(
 
 # ==== /short_pnl (realized P&L for SHORT trades, FIFO) ====
 
+# ---- JSON body model just for POST /short_pnl ----
+from pydantic import BaseModel
+
+class ShortPnlBody(BaseModel):
+    start_date: Optional[str] = None   # "YYYY-MM-DD"
+    end_date:   Optional[str] = None   # "YYYY-MM-DD"
+    top_k:      int = 5000
+    file:       Optional[str] = None
+
+# ==== /short_pnl (POST: accepts JSON body) ====
 @app.post("/short_pnl")
-def short_pnl(
-    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
-    top_k: int                = Query(5000, description="How many rows to scan"),
-    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
+def short_pnl_post(
+    body: ShortPnlBody,
     authorization: Optional[str] = Header(default=None),
 ):
     """
@@ -649,9 +656,14 @@ def short_pnl(
     - Uses vector rows where Type == SHORT, qty != 0, symbol != MARKET
     - qty < 0 = open short (sell); qty > 0 = cover (buy)
     - PnL = (open_price - cover_price) * matched_shares
-    - Returns realized PnL by symbol and any open lots still outstanding
     """
     _check_bearer(authorization)
+
+    # pull from JSON body
+    start_date = body.start_date
+    end_date   = body.end_date
+    top_k      = body.top_k
+    file       = (body.file or None)
 
     start_dt = _parse_any_date(start_date) if start_date else None
     end_dt   = _parse_any_date(end_date)   if end_date   else None
@@ -662,10 +674,8 @@ def short_pnl(
         d = _parse_any_date(dstr)
         if not d:
             return False
-        if start_dt and d < start_dt:
-            return False
-        if end_dt and d > end_dt:
-            return False
+        if start_dt and d < start_dt: return False
+        if end_dt   and d > end_dt:   return False
         return True
 
     ns = "trading"
@@ -684,7 +694,6 @@ def short_pnl(
             if v is None:
                 continue
             try:
-                # handle strings like "-3,000"
                 if isinstance(v, str):
                     v = v.replace(",", "").strip()
                 return float(v)
@@ -694,6 +703,7 @@ def short_pnl(
 
     for m in matches:
         md = (getattr(m, "metadata", {}) or {})
+
         # Optional: restrict to a specific uploaded CSV
         if file and str(md.get("file", "")).strip() != file.strip():
             continue
@@ -719,7 +729,6 @@ def short_pnl(
             continue
         price = get_num(md.get("Price"), md.get("price"))
         if price == 0:
-            # skip rows without a usable price
             continue
 
         rows_scanned += 1
@@ -731,7 +740,7 @@ def short_pnl(
             realized_by_symbol[sym] = 0.0
 
         if qty < 0:
-            # Open short: store positive share count for convenience
+            # Open short
             open_lots[sym].append({
                 "shares": int(abs(qty)),
                 "price": float(price),
@@ -748,8 +757,7 @@ def short_pnl(
             while cover > 0 and i < len(lots):
                 lot = lots[i]
                 match_shares = min(cover, lot["shares"])
-                # Short PnL = (open - cover) * shares
-                pnl = (lot["price"] - price) * match_shares
+                pnl = (lot["price"] - price) * match_shares  # short PnL
                 realized_by_symbol[sym] += pnl
 
                 lot["shares"] -= match_shares
@@ -758,9 +766,8 @@ def short_pnl(
                     lots.pop(i)
                 else:
                     i += 1
-            # If cover > 0 here, unmatched cover (no open lot) is ignored.
+            # If cover > 0: unmatched cover — ignored
 
-    # Prepare outputs
     realized_list = [
         {"symbol": s, "realized_pnl": round(v, 2)}
         for s, v in realized_by_symbol.items()
@@ -790,8 +797,6 @@ def short_pnl(
         "total_realized_pnl": total_realized,
         "open_short_shares_by_symbol": open_short_shares_by_symbol,
     }
-
-
 # GET alias so tools that prefer GET can call the same logic as POST
 @app.get("/short_pnl", summary="Short PnL (GET alias)")
 def short_pnl_get(
