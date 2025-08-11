@@ -215,7 +215,7 @@ def ask(body: AskBody, authorization: Optional[str] = Header(default=None)):
         "suggested_instruction": "Use the context excerpts to answer the user's question. Cite titles/sources from context. If something is unclear or missing, say so."
     }
 
-# ==== /fees (SAFE math: fee columns + borrow/overnight + fallback to fees_total when no columns) ====
+# ==== /fees (CSV rollup across common fee columns + borrow/overnight; safe math) ====
 @app.post("/fees")
 def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
     _check_bearer(authorization)
@@ -234,77 +234,58 @@ def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
         return True
 
     ns = body.namespace or "trading"
-    # broad, neutral query to pull trade/fee rows
-    vec = embed_query("broker activity trade rows fees columns borrow overnight fees_total")
+    # Keep query broad; we filter by file/date below
+    vec = embed_query("broker activity trade rows fee columns borrow overnight")
     res = index.query(vector=vec, top_k=body.top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
     fee_cols = ["TransFee", "ECNTaker", "ECNMaker", "ORFFee", "TAFFee", "SECFee", "CATFee", "Commissions"]
 
-    # Accumulators
-    by_col_sum = 0.0                    # sum of all explicit fee columns (net; positives reduce total if they’re rebates)
-    by_col_detail = {c: 0.0 for c in fee_cols}
+    by_col: Dict[str, float] = {c: 0.0 for c in fee_cols}
     borrow_fees = 0.0
     overnight_fees = 0.0
-    fallback_trade_sum = 0.0            # fees_total used only when ALL fee columns are zero
-    fallback_trade_rows = 0
     rows_scanned = 0
 
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
 
-        # File/date filters
-        if body.file and str(md.get("file", "")).strip() != body.file.strip():
+        # Optional file filter
+        if body.file and str(md.get("file", "")).strip() != str(body.file).strip():
             continue
+
+        # Date filter
         if not in_range(str(md.get("date", ""))):
             continue
 
-        rows_scanned += 1
+        # Sum explicit fee columns safely (nulls, strings like "-3,000", "$12.34", etc.)
+        for c in fee_cols:
+            by_col[c] += _safe_float(md.get(c, 0.0), 0.0)
 
-        # 1) Borrow / Overnight (add once)
-        ft = str(md.get("fee_type") or "").lower()
+        # Borrow / overnight come from dedicated rows with fee_type + amount
+        ft  = str(md.get("fee_type") or "").strip().lower()
         amt = _safe_float(md.get("amount", 0.0), 0.0)
         if ft == "borrow_fee":
             borrow_fees += amt
         elif ft == "overnight_borrow_fee":
             overnight_fees += amt
 
-        # 2) Explicit fee columns (sum them)
-        fee_cols_value = 0.0
-        for c in fee_cols:
-            v = _safe_float(md.get(c, 0.0), 0.0)
-            if v != 0.0:
-                by_col_detail[c] += v
-                fee_cols_value += v
+        rows_scanned += 1
 
-        # 3) Only if ALL fee columns are zero, fall back to fees_total
-        if abs(fee_cols_value) < 1e-12:
-            roll = _safe_float(md.get("fees_total", 0.0), 0.0)
-            if abs(roll) > 0:
-                # Treat positives as rebates: subtract; negatives are costs: add
-                fallback_trade_sum += (-roll if roll > 0 else roll)
-                fallback_trade_rows += 1
-        else:
-            by_col_sum += fee_cols_value
+    by_column_sum = sum(by_col.values())
+    grand_total = by_column_sum + borrow_fees + overnight_fees
 
-    # Final all-in
-    grand_total_all_in = by_col_sum + borrow_fees + overnight_fees + fallback_trade_sum
-
-    # Pretty print
     pretty_lines = []
-    pretty_lines.append(f"Rows scanned: {rows_scanned}\n")
-    pretty_lines.append("--- Fee columns (explicit columns only; rebates reduce cost if positive) ---")
+    pretty_lines.append(f"Rows scanned: {rows_scanned}")
+    pretty_lines.append("")
+    pretty_lines.append("--- Fee columns ---")
     for c in fee_cols:
-        pretty_lines.append(f"{c:<11}: ${by_col_detail[c]:,.2f}")
+        pretty_lines.append(f"{c:<10}: ${by_col[c]:,.2f}")
     pretty_lines.append("")
     pretty_lines.append(f"Borrow fees: ${borrow_fees:,.2f}")
     pretty_lines.append(f"Overnight fees: ${overnight_fees:,.2f}")
     pretty_lines.append("")
-    pretty_lines.append(f"fees_total fallback (rows when columns=0): {fallback_trade_rows}")
-    pretty_lines.append(f"fees_total fallback (sum, rebates subtracted): ${fallback_trade_sum:,.2f}")
-    pretty_lines.append("")
-    pretty_lines.append("=== ALL-IN FEES (safe; no double counting) ===")
-    pretty_lines.append(f"${grand_total_all_in:,.2f}")
+    pretty_lines.append("=== ALL-IN FEES (fee columns + borrow + overnight) ===")
+    pretty_lines.append(f"${grand_total:,.2f}")
 
     return {
         "ok": True,
@@ -319,16 +300,15 @@ def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
         },
         "rows_scanned": rows_scanned,
         "totals": {
-            "by_column": by_col_detail,
-            "by_column_sum": by_col_sum,
-            "borrow_fees": borrow_fees,
-            "overnight_fees": overnight_fees,
-            "trade_fallback_rows": fallback_trade_rows,
-            "trade_fallback_sum": fallback_trade_sum,
-            "grand_total_all_in": grand_total_all_in,
+            "by_column": by_col,
+            "by_column_sum": round(by_column_sum, 2),
+            "borrow_fees": round(borrow_fees, 2),
+            "overnight_fees": round(overnight_fees, 2),
+            "grand_total_all_in": round(grand_total, 2),
         },
         "pretty": "\n".join(pretty_lines),
     }
+    
 # ==== /fees_summary (symbol-level daily & monthly) ====
 @app.post("/fees_summary")
 def fees_summary(
