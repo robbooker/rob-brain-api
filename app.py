@@ -1,8 +1,6 @@
 # app.py
 # FastAPI app for Rob Brain API
 # Endpoints: /healthz, /search, /ask, /fees, /fees_summary, /fees_rollup, /short_pnl
-app = FastAPI(title="Rob Forever Brain API", version="2.2.2")
-
 
 import os
 import math
