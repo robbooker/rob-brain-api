@@ -117,20 +117,20 @@ class FeesBody(BaseModel):
 def healthz():
     try:
         stats = index.describe_index_stats()
-        # Try to detect the dimensionality if stored elsewhere
         idx_dim = EMBED_DIM
     except Exception:
         stats = {}
         idx_dim = EMBED_DIM
     return {
         "ok": True,
+        "version": app.version,  # Add this line
         "index": INDEX_NAME,
         "index_dimension": idx_dim,
         "embed_model": EMBED_MODEL,
         "embed_model_dim": EMBED_DIM,
         "namespaces": list((stats.get("namespaces") or {}).keys()) or ["nonfiction", "trading"]
     }
-
+    
 # ==== /search (legacy) ====
 @app.post("/search")
 def search(body: SearchBody, authorization: Optional[str] = Header(default=None)):
