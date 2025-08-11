@@ -640,3 +640,119 @@ def short_pnl(
         "total_realized_pnl": total_realized,
         "open_short_shares_by_symbol": open_short_shares_by_symbol,
     }
+
+# ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
+
+@app.get("/shorts_over_price")
+def shorts_over_price(
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD start (inclusive)"),
+    end_date:   Optional[str] = Query(None, description="YYYY-MM-DD end (inclusive)"),
+    min_price:  float         = Query(20.0, description="Minimum entry price to include"),
+    file:       Optional[str] = Query(None, description="Restrict to this CSV filename"),
+    entry_only: bool          = Query(True, description="Only include entry rows (qty<0 or side=Sell)"),
+    top_k:      int           = Query(5000, description="Vector rows to scan"),
+    namespace:  str           = Query("trading", description="Vector namespace"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Returns SHORT trade rows whose PRICE > min_price within a date window.
+    Defaults to *entry* rows only (qty<0 or side=Sell).
+    Output: [{date, symbol, price, qty, side, description, file}]
+    """
+    _check_bearer(authorization)
+
+    # date helpers
+    start_dt = _parse_any_date(start_date) if start_date else None
+    end_dt   = _parse_any_date(end_date)   if end_date   else None
+
+    def in_range(dstr: str) -> bool:
+        if not (start_dt or end_dt):
+            return True
+        d = _parse_any_date(dstr)
+        if not d:
+            return False
+        if start_dt and d < start_dt: return False
+        if end_dt   and d > end_dt:   return False
+        return True
+
+    # target the right rows in vector search, then filter tightly
+    vec = embed_query("Type SHORT trades with price quantity side date symbol")
+    res = index.query(vector=vec, top_k=top_k, namespace=namespace, include_metadata=True)
+    matches = getattr(res, "matches", []) or []
+
+    def num(*vals, default=0.0):
+        for v in vals:
+            if v is None: 
+                continue
+            try:
+                if isinstance(v, str):
+                    v = v.replace(",", "").strip()
+                return float(v)
+            except Exception:
+                pass
+        return float(default)
+
+    out = []
+    rows_scanned = 0
+
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+
+        # optional file restriction
+        if file and str(md.get("file", "")).strip() != file.strip():
+            continue
+
+        dstr = str(md.get("date", "")).strip()
+        if not dstr or not in_range(dstr):
+            continue
+
+        # must be SHORT type
+        tval = (md.get("Type") or md.get("type") or "").strip().upper()
+        if tval != "SHORT":
+            continue
+
+        sym = (md.get("symbol") or md.get("Symbol") or "").strip().upper()
+        if not sym or sym == "MARKET":
+            continue
+
+        price = num(md.get("Price"), md.get("price"))
+        if not price or price <= float(min_price):
+            continue
+
+        qty = num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"))
+        side = (md.get("B/S") or md.get("BS") or md.get("side") or md.get("Side") or "").strip().upper()
+
+        if entry_only:
+            is_entry = (qty < 0) or (side in ("SELL", "S"))
+            if not is_entry:
+                continue
+
+        rows_scanned += 1
+        out.append({
+            "date": dstr,
+            "symbol": sym,
+            "price": round(price, 5),
+            "qty": int(qty) if qty == int(qty) else qty,
+            "side": side or ("SELL" if qty < 0 else "BUY"),
+            "description": md.get("description") or md.get("Description") or "",
+            "file": md.get("file", "")
+        })
+
+    # sort: date then symbol
+    out.sort(key=lambda r: (r["date"], r["symbol"]))
+
+    return {
+        "ok": True,
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "min_price": min_price,
+            "file": file,
+            "entry_only": entry_only,
+            "top_k": top_k,
+            "namespace": namespace
+        },
+        "rows_scanned": rows_scanned,
+        "count": len(out),
+        "rows": out
+    }
