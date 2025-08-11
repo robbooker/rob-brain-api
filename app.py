@@ -792,8 +792,8 @@ def short_pnl(
     }
 
 
-# GET alias so tools that prefer GET can call it via query params
-@app.get("/short_pnl", summary="Short PnL (GET alias)", description="Identical to POST /short_pnl; forwards all args to the POST handler.")
+# GET alias so tools that prefer GET can call the same logic as POST
+@app.get("/short_pnl", summary="Short PnL (GET alias)")
 def short_pnl_get(
     start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
     end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
@@ -801,7 +801,7 @@ def short_pnl_get(
     file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
     authorization: Optional[str] = Header(default=None),
 ):
-    # Forward directly to the POST implementation to guarantee identical behavior
+    # Reuse the POST implementation to ensure identical behavior
     return short_pnl(
         start_date=start_date,
         end_date=end_date,
