@@ -634,218 +634,77 @@ def _short_pnl_core(
         "total_realized_pnl": total_realized,
     }
 
-# ==== /short_pnl (realized P&L for SHORT trades, FIFO) ====
+# ==== /short_pnl (revised: use B/S to pair sells->buys & ignore mark-to-market) ====
 
-# ---- JSON body model just for POST /short_pnl ----
-from pydantic import BaseModel
-
-class ShortPnlBody(BaseModel):
-    start_date: Optional[str] = None   # "YYYY-MM-DD"
-    end_date:   Optional[str] = None   # "YYYY-MM-DD"
-    top_k:      int = 5000
-    file:       Optional[str] = None
-
-# ==== /short_pnl (POST: accepts JSON body) ====
 @app.post("/short_pnl")
-def short_pnl_post(
-    body: ShortPnlBody,
-    authorization: Optional[str] = Header(default=None),
-):
-    """
-    Realized P&L for SHORT trades over a date window (FIFO):
-    - Uses vector rows where Type == SHORT, qty != 0, symbol != MARKET
-    - qty < 0 = open short (sell); qty > 0 = cover (buy)
-    - PnL = (open_price - cover_price) * matched_shares
-    """
-    _check_bearer(authorization)
-
-    # pull from JSON body
-    start_date = body.start_date
-    end_date   = body.end_date
-    top_k      = body.top_k
-    file       = (body.file or None)
-
-    start_dt = _parse_any_date(start_date) if start_date else None
-    end_dt   = _parse_any_date(end_date)   if end_date   else None
-
-    def in_range(dstr: str) -> bool:
-        if not (start_dt or end_dt):
-            return True
-        d = _parse_any_date(dstr)
-        if not d:
-            return False
-        if start_dt and d < start_dt: return False
-        if end_dt   and d > end_dt:   return False
-        return True
-
-    ns = "trading"
-    vec = embed_query("Type SHORT short trades sell buy cover quantity price FIFO PnL")
-    res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
-    matches = getattr(res, "matches", []) or []
-
-    # Per-symbol FIFO open lots: list of dicts {shares:int, price:float, date:str}
-    open_lots: Dict[str, List[Dict[str, Any]]] = {}
-    realized_by_symbol: Dict[str, float] = {}
-    rows_scanned = 0
-    trades_used = 0
-
-    def get_num(*vals, default=0.0):
-        for v in vals:
-            if v is None:
-                continue
-            try:
-                if isinstance(v, str):
-                    v = v.replace(",", "").strip()
-                return float(v)
-            except Exception:
-                pass
-        return float(default)
-
-    for m in matches:
-        md = (getattr(m, "metadata", {}) or {})
-
-        # Optional: restrict to a specific uploaded CSV
-        if file and str(md.get("file", "")).strip() != file.strip():
-            continue
-
-        # Date filter
-        dstr = str(md.get("date", "")).strip()
-        if not dstr or not in_range(dstr):
-            continue
-
-        # Type must be SHORT
-        tval = (md.get("Type") or md.get("type") or "").strip().upper()
-        if tval != "SHORT":
-            continue
-
-        # Symbol present and not MARKET
-        sym = (md.get("symbol") or md.get("Symbol") or "").strip().upper()
-        if not sym or sym == "MARKET":
-            continue
-
-        # Quantity and Price
-        qty = get_num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"))
-        if qty == 0:
-            continue
-        price = get_num(md.get("Price"), md.get("price"))
-        if price == 0:
-            continue
-
-        rows_scanned += 1
-
-        # Initialize symbol buckets
-        if sym not in open_lots:
-            open_lots[sym] = []
-        if sym not in realized_by_symbol:
-            realized_by_symbol[sym] = 0.0
-
-        if qty < 0:
-            # Open short
-            open_lots[sym].append({
-                "shares": int(abs(qty)),
-                "price": float(price),
-                "date": dstr,
-            })
-            trades_used += 1
-        else:
-            # Cover: FIFO match against open lots
-            cover = int(qty)
-            trades_used += 1
-
-            lots = open_lots[sym]
-            i = 0
-            while cover > 0 and i < len(lots):
-                lot = lots[i]
-                match_shares = min(cover, lot["shares"])
-                pnl = (lot["price"] - price) * match_shares  # short PnL
-                realized_by_symbol[sym] += pnl
-
-                lot["shares"] -= match_shares
-                cover -= match_shares
-                if lot["shares"] == 0:
-                    lots.pop(i)
-                else:
-                    i += 1
-            # If cover > 0: unmatched cover — ignored
-
-    realized_list = [
-        {"symbol": s, "realized_pnl": round(v, 2)}
-        for s, v in realized_by_symbol.items()
-        if abs(v) > 1e-9
-    ]
-    realized_list.sort(key=lambda x: x["realized_pnl"], reverse=True)
-
-    total_realized = round(sum(x["realized_pnl"] for x in realized_list), 2)
-
-    open_short_shares_by_symbol = {
-        s: sum(lot["shares"] for lot in lots) for s, lots in open_lots.items()
-        if sum(lot["shares"] for lot in lots) != 0
-    }
-
-    return {
-        "ok": True,
-        "filters": {
-            "start_date": start_date,
-            "end_date": end_date,
-            "top_k": top_k,
-            "file": file,
-            "namespace": ns
-        },
-        "rows_scanned": rows_scanned,
-        "trades_used": trades_used,
-        "realized_by_symbol": realized_list,
-        "total_realized_pnl": total_realized,
-        "open_short_shares_by_symbol": open_short_shares_by_symbol,
-    }
-    
-# GET /short_pnl — self-contained (no dependency on the POST function name)
-@app.get("/short_pnl")
-def short_pnl_get(
+def short_pnl(
     start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
-    top_k: int                = Query(5000, description="How many rows to scan"),
-    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
+    end_date:   Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    top_k: int  = Query(5000, description="How many rows to scan"),
+    file: Optional[str] = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
     authorization: Optional[str] = Header(default=None),
 ):
+    """
+    Realized P&L for SHORT trades over a date window (FIFO), using Rob's rules:
+
+    - Type must be SHORT.
+    - Use the B/S column to identify trade direction:
+        SELL  => open short (entry)
+        BUY   => cover short (exit)
+      Ignore any other B/S values (BO, SC, etc).
+    - Ignore non-trade accounting rows like "SHORT ACCT. MARK TO MARKET".
+    - FIFO match SELL lots to later BUY lots of the same symbol.
+    - PnL per match = (entry_price - cover_price) * matched_shares
+    """
     _check_bearer(authorization)
 
     start_dt = _parse_any_date(start_date) if start_date else None
     end_dt   = _parse_any_date(end_date)   if end_date   else None
 
     def in_range(dstr: str) -> bool:
-        if not (start_dt or end_dt):
-            return True
+        if not (start_dt or end_dt): return True
         d = _parse_any_date(dstr)
-        if not d:
-            return False
+        if not d: return False
         if start_dt and d < start_dt: return False
         if end_dt   and d > end_dt:   return False
         return True
 
+    def num(*vals, default=0.0) -> float:
+        for v in vals:
+            if v is None: 
+                continue
+            try:
+                s = str(v).replace(",", "").strip()
+                if s == "": 
+                    continue
+                return float(s)
+            except:
+                continue
+        return float(default)
+
+    def side_of(md: Dict[str, Any]) -> str:
+        # normalize B/S variants
+        raw = (
+            md.get("B/S") or md.get("B_S") or md.get("BS") or
+            md.get("side") or md.get("Side") or ""
+        )
+        return str(raw).strip().upper()
+
     ns = "trading"
-    vec = embed_query("Type SHORT short trades sell buy cover quantity price FIFO PnL")
+    vec = embed_query("Type SHORT trades Quantity Price B/S buy sell cover FIFO realized PnL")
     res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
-    open_lots: Dict[str, List[Dict[str, Any]]] = {}
+    # state
+    open_lots: Dict[str, List[Dict[str, Any]]] = {}   # symbol -> [{shares, price, date}]
     realized_by_symbol: Dict[str, float] = {}
     rows_scanned = 0
-    trades_used = 0
-
-    def get_num(*vals, default=0.0):
-        for v in vals:
-            if v is None:
-                continue
-            try:
-                if isinstance(v, str):
-                    v = v.replace(",", "").strip()
-                return float(v)
-            except Exception:
-                pass
-        return float(default)
+    trades_used  = 0
 
     for m in matches:
-        md = (getattr(m, "metadata", {}) or {})
+        md = getattr(m, "metadata", {}) or {}
+
+        # optional filename filter
         if file and str(md.get("file", "")).strip() != file.strip():
             continue
 
@@ -853,53 +712,62 @@ def short_pnl_get(
         if not dstr or not in_range(dstr):
             continue
 
+        # Must be a SHORT trade
         tval = (md.get("Type") or md.get("type") or "").strip().upper()
         if tval != "SHORT":
+            continue
+
+        # Skip accounting rows (not real trades)
+        descr = str(md.get("description") or md.get("Description") or "").upper()
+        if "MARK TO MARKET" in descr:
+            continue
+
+        # Determine side strictly from B/S
+        side = side_of(md)
+        if side not in ("SELL", "BUY"):
+            # ignore BO, SC, MISC, etc.
             continue
 
         sym = (md.get("symbol") or md.get("Symbol") or "").strip().upper()
         if not sym or sym == "MARKET":
             continue
 
-        qty = get_num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"))
-        if qty == 0:
-            continue
-        price = get_num(md.get("Price"), md.get("price"))
-        if price == 0:
+        qty   = int(abs(num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"), default=0)))
+        price = num(md.get("Price"), md.get("price"), default=0)
+        if qty == 0 or price == 0:
             continue
 
         rows_scanned += 1
 
+        # init buckets
         if sym not in open_lots:
             open_lots[sym] = []
         if sym not in realized_by_symbol:
             realized_by_symbol[sym] = 0.0
 
-        if qty < 0:
-            open_lots[sym].append({
-                "shares": int(abs(qty)),
-                "price": float(price),
-                "date": dstr,
-            })
+        if side == "SELL":
+            # Open short lot
+            open_lots[sym].append({"shares": qty, "price": float(price), "date": dstr})
             trades_used += 1
         else:
-            cover = int(qty)
-            trades_used += 1
-
-            lots = open_lots[sym]
+            # BUY -> cover existing short lots (FIFO)
+            cover = qty
             i = 0
+            lots = open_lots[sym]
             while cover > 0 and i < len(lots):
                 lot = lots[i]
-                match_shares = min(cover, lot["shares"])
-                pnl = (lot["price"] - price) * match_shares
+                take = min(cover, lot["shares"])
+                pnl  = (lot["price"] - price) * take
                 realized_by_symbol[sym] += pnl
 
-                lot["shares"] -= match_shares
-                cover -= match_shares
+                lot["shares"] -= take
+                cover         -= take
                 if lot["shares"] == 0:
                     lots.pop(i)
                 else:
                     i += 1
+            trades_used += 1
+            # If cover > 0 remains, it's an unmatched BUY; we ignore the excess.
 
     realized_list = [
         {"symbol": s, "realized_pnl": round(v, 2)}
@@ -907,11 +775,12 @@ def short_pnl_get(
         if abs(v) > 1e-9
     ]
     realized_list.sort(key=lambda x: x["realized_pnl"], reverse=True)
-    total_realized = round(sum(x["realized_pnl"] for x in realized_list), 2)
+
+    total_realized = round(sum(r["realized_pnl"] for r in realized_list), 2)
 
     open_short_shares_by_symbol = {
-        s: sum(lot["shares"] for lot in lots) for s, lots in open_lots.items()
-        if sum(lot["shares"] for lot in lots) != 0
+        s: sum(l["shares"] for l in lots) for s, lots in open_lots.items()
+        if sum(l["shares"] for l in lots) != 0
     }
 
     return {
@@ -928,9 +797,12 @@ def short_pnl_get(
         "realized_by_symbol": realized_list,
         "total_realized_pnl": total_realized,
         "open_short_shares_by_symbol": open_short_shares_by_symbol,
+        "notes": [
+            "Paired SELL (entry) -> BUY (exit) using B/S column; ignored BO/SC/etc.",
+            "Ignored rows whose description contains 'MARK TO MARKET'.",
+            "FIFO matching per symbol; PnL = (entry_price - cover_price) * shares."
+        ]
     }
-
-
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
 
 @app.get("/shorts_over_price")
