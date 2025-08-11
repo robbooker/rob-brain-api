@@ -31,7 +31,7 @@ INDEX_NAME = os.getenv("PINECONE_INDEX", "rob-brain")
 index = pc.Index(INDEX_NAME)
 
 # ==== FastAPI ====
-app = FastAPI(title="Rob Forever Brain API", version="2.2.4")
+app = FastAPI(title="Rob Forever Brain API", version="2.2.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -634,7 +634,7 @@ def _short_pnl_core(
         "total_realized_pnl": total_realized,
     }
 
-# ==== /short_pnl (new) ====
+# ==== /short_pnl (realized P&L for SHORT trades, FIFO) ====
 
 @app.post("/short_pnl")
 def short_pnl(
@@ -758,8 +758,7 @@ def short_pnl(
                     lots.pop(i)
                 else:
                     i += 1
-
-            # If cover > 0 here, we had an unmatched cover (no open lot). Ignore or log.
+            # If cover > 0 here, unmatched cover (no open lot) is ignored.
 
     # Prepare outputs
     realized_list = [
@@ -792,15 +791,14 @@ def short_pnl(
         "open_short_shares_by_symbol": open_short_shares_by_symbol,
     }
 
-# --- keep your existing POST /short_pnl exactly as-is ---
 
 # GET alias so tools that prefer GET can call it via query params
-@app.get("/short_pnl")
+@app.get("/short_pnl", summary="Short PnL (GET)")
 def short_pnl_get(
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str]   = Query(None),
-    top_k: int                = Query(5000),
-    file: Optional[str]       = Query(None),
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
+    top_k: int                = Query(5000, description="How many rows to scan"),
+    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
     authorization: Optional[str] = Header(default=None),
 ):
     # Reuse the same implementation by calling the POST handler
@@ -811,6 +809,7 @@ def short_pnl_get(
         file=file,
         authorization=authorization,
     )
+
 
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
 
