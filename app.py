@@ -39,6 +39,28 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
+# ADD THIS BLOCK RIGHT HERE
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema["servers"] = [
+        {"url": "https://rob-brain-api.onrender.com", "description": "prod"}
+    ]
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+# END OF BLOCK
+
+
 # ==== Helpers ====
 def _check_bearer(authorization: Optional[str]) -> None:
     want = os.getenv("API_BEARER", "H@173y8004er")
