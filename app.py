@@ -31,7 +31,7 @@ INDEX_NAME = os.getenv("PINECONE_INDEX", "rob-brain")
 index = pc.Index(INDEX_NAME)
 
 # ==== FastAPI ====
-app = FastAPI(title="Rob Forever Brain API", version="2.2.0")
+app = FastAPI(title="Rob Forever Brain API", version="2.2.2")
 
 app.add_middleware(
     CORSMiddleware,
