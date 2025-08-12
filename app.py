@@ -505,7 +505,16 @@ def fees_rollup(
         "pretty": "\n".join(pretty)
     }
 
-# ==== /short_pnl (FIFO via Type=SHORT and B/S SELL/BUY only) ====
+# ==== /short_pnl (FIFO via Type=SHORT; robust side + POST body support) ====
+
+from pydantic import BaseModel
+from fastapi import Body
+
+class ShortPnlBody(BaseModel):
+    start_date: Optional[str] = None  # YYYY-MM-DD
+    end_date: Optional[str]   = None  # YYYY-MM-DD
+    top_k: int                = 5000
+    file: Optional[str]       = None  # CSV filename filter
 
 def _short_pnl_core(
     start_date: Optional[str],
@@ -545,32 +554,55 @@ def _short_pnl_core(
                 pass
         return float(default)
 
-    def get_side(md: Dict[str, Any]) -> str:
-        # Side may appear in a few places/labels
-        raw = (
-            md.get("B/S")
-            or md.get("BS")
-            or md.get("Side")
-            or md.get("side")
-            or ""
-        )
-        return str(raw).strip().upper()
-
     def get_type(md: Dict[str, Any]) -> str:
         return str(md.get("Type") or md.get("type") or "").strip().upper()
 
     def get_symbol(md: Dict[str, Any]) -> str:
         return str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
 
+    def read_side_field(md: Dict[str, Any]) -> str:
+        raw = (
+            md.get("B/S")
+            or md.get("BS")
+            or md.get("B_S")
+            or md.get("Side")
+            or md.get("side")
+            or ""
+        )
+        s = str(raw).strip().upper()
+        # normalize one-letter codes
+        if s == "S":
+            return "SELL"
+        if s == "B":
+            return "BUY"
+        return s
+
+    def infer_side(md: Dict[str, Any]) -> Optional[str]:
+        """
+        Prefer explicit B/S if it's SELL/BUY. If missing/unknown, fall back to qty sign.
+        Ignore BO/SC/etc by returning None.
+        """
+        s = read_side_field(md)
+        if s in ("SELL", "BUY"):
+            return s
+        if s in ("BO", "SC", "SS", "BC", "COVER", "OPEN", "CXL", ""):
+            # not a plain SELL/BUY signal; try qty fallback
+            pass
+
+        qty = get_num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"))
+        if qty < 0:
+            return "SELL"  # open short
+        if qty > 0:
+            return "BUY"   # cover
+        return None
+
     # --- vector query ---
     ns = "trading"
-    # keep this broad; we filter strictly below
-    vec = embed_query("SHORT trades B/S SELL BUY cover quantity price FIFO realized PnL")
+    vec = embed_query("SHORT trades SELL BUY cover quantity price FIFO realized PnL B/S side")
     res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
     # --- FIFO state ---
-    # per symbol: list of open short lots -> {"shares": int, "price": float, "date": str}
     open_lots: Dict[str, List[Dict[str, Any]]] = {}
     realized_by_symbol: Dict[str, float] = {}
     rows_scanned = 0
@@ -580,15 +612,13 @@ def _short_pnl_core(
         md = getattr(m, "metadata", {}) or {}
 
         # optional file constraint
-        if file and str(md.get("file", "")).strip() != file.strip():
+        if file and str(md.get("file", "")).strip() != (file or "").strip():
             continue
 
-        # date constraint
         dstr = str(md.get("date", "")).strip()
         if not dstr or not in_range(dstr):
             continue
 
-        # we only care about SHORT rows
         if get_type(md) != "SHORT":
             continue
 
@@ -596,8 +626,7 @@ def _short_pnl_core(
         if not sym or sym == "MARKET":
             continue
 
-        side = get_side(md)
-        # Only SELL (open) and BUY (cover) count. Ignore everything else (BO, SC, etc.)
+        side = infer_side(md)
         if side not in ("SELL", "BUY"):
             continue
 
@@ -623,7 +652,7 @@ def _short_pnl_core(
             })
             trades_used += 1
         else:
-            # side == "BUY" -> cover against FIFO short lots
+            # side == BUY -> cover against FIFO short lots
             cover = int(abs(qty))
             trades_used += 1
 
@@ -632,8 +661,7 @@ def _short_pnl_core(
             while cover > 0 and i < len(lots):
                 lot = lots[i]
                 match_shares = min(cover, lot["shares"])
-                # Short PnL = (open - cover) * shares
-                pnl = (lot["price"] - price) * match_shares
+                pnl = (lot["price"] - price) * match_shares  # short PnL
                 realized_by_symbol[sym] += pnl
 
                 lot["shares"] -= match_shares
@@ -642,17 +670,14 @@ def _short_pnl_core(
                     lots.pop(i)
                 else:
                     i += 1
-            # If cover > 0 and no lots left, the extra is unmatched; ignore (or log) by design.
+            # unmatched extra BUY shares (no open lots) are ignored by design
 
-    # --- outputs ---
     realized_list = [
         {"symbol": s, "realized_pnl": round(v, 2)}
         for s, v in realized_by_symbol.items()
         if abs(v) > 1e-9
     ]
-    # sort by realized PnL descending (winners first)
     realized_list.sort(key=lambda x: x["realized_pnl"], reverse=True)
-
     total_realized = round(sum(x["realized_pnl"] for x in realized_list), 2)
 
     open_short_shares_by_symbol = {
@@ -660,9 +685,6 @@ def _short_pnl_core(
         for s, lots in open_lots.items()
         if sum(lot["shares"] for lot in lots) != 0
     }
-
-    # small sample back to caller
-    sample = realized_list[:5]
 
     return {
         "ok": True,
@@ -678,29 +700,33 @@ def _short_pnl_core(
         "realized_by_symbol": realized_list,
         "total_realized_pnl": total_realized,
         "open_short_shares_by_symbol": open_short_shares_by_symbol,
-        "sample": sample,
+        "sample": realized_list[:5],
     }
 
 
+# POST accepts JSON body (so your -d '{}' works)
 @app.post("/short_pnl")
 def short_pnl(
-    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
-    top_k: int                = Query(5000, description="How many rows to scan"),
-    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
+    body: ShortPnlBody = Body(...),
     authorization: Optional[str] = Header(default=None),
 ):
     """
     Realized P&L for SHORT trades over a date window (FIFO), using:
       - Type == SHORT
-      - B/S (side) == SELL for opening shorts; BUY for covers
-      - Ignore other B/S values (BO, SC, etc.)
-      - Excludes symbol == MARKET
-    Short PnL per fill is (open_price - cover_price) * matched_shares (FIFO by symbol).
+      - SELL/BUY from B/S/Side columns; if absent, fall back to qty sign (qty<0 open, qty>0 cover)
+      - Ignore BO/SC/etc.
+      - Exclude symbol == MARKET
     """
-    return _short_pnl_core(start_date, end_date, top_k, file, authorization)
+    return _short_pnl_core(
+        start_date=body.start_date,
+        end_date=body.end_date,
+        top_k=body.top_k,
+        file=body.file,
+        authorization=authorization,
+    )
 
 
+# GET alias (query params) calls the same core
 @app.get("/short_pnl")
 def short_pnl_get(
     start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
@@ -709,7 +735,6 @@ def short_pnl_get(
     file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
     authorization: Optional[str] = Header(default=None),
 ):
-    # GET alias calls the same core so POST and GET always match
     return _short_pnl_core(start_date, end_date, top_k, file, authorization)
     
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
