@@ -736,6 +736,178 @@ def short_pnl_get(
     authorization: Optional[str] = Header(default=None),
 ):
     return _short_pnl_core(start_date, end_date, top_k, file, authorization)
+
+# ==== /short_pnl_breakdown (list each matched FIFO leg) ====
+
+@app.get("/short_pnl_breakdown")
+def short_pnl_breakdown(
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
+    top_k: int                = Query(5000, description="How many rows to scan"),
+    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
+    limit: int                = Query(1000, description="Max legs to return (for payload safety)"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Returns each realized SHORT P&L 'leg' matched FIFO:
+      { symbol, shares, open_date, open_price, cover_date, cover_price, pnl }
+    Uses the same robust side/qty rules as /short_pnl.
+    """
+    _check_bearer(authorization)
+
+    # ---- helpers duplicated for clarity (kept local to avoid coupling) ----
+    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+        return _parse_any_date(s)
+
+    start_dt = _parse_dt(start_date) if start_date else None
+    end_dt   = _parse_dt(end_date)   if end_date   else None
+
+    def in_range(dstr: str) -> bool:
+        if not (start_dt or end_dt):
+            return True
+        d = _parse_dt(dstr)
+        if not d:
+            return False
+        if start_dt and d < start_dt: return False
+        if end_dt and d > end_dt:     return False
+        return True
+
+    def get_num(*vals, default=0.0):
+        for v in vals:
+            if v is None:
+                continue
+            try:
+                if isinstance(v, str):
+                    v = v.replace(",", "").strip()
+                return float(v)
+            except Exception:
+                pass
+        return float(default)
+
+    def get_type(md: Dict[str, Any]) -> str:
+        return str(md.get("Type") or md.get("type") or "").strip().upper()
+
+    def get_symbol(md: Dict[str, Any]) -> str:
+        return str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
+
+    def read_side_field(md: Dict[str, Any]) -> str:
+        raw = md.get("B/S") or md.get("BS") or md.get("B_S") or md.get("Side") or md.get("side") or ""
+        s = str(raw).strip().upper()
+        if s == "S": return "SELL"
+        if s == "B": return "BUY"
+        return s
+
+    def infer_side(md: Dict[str, Any]) -> Optional[str]:
+        s = read_side_field(md)
+        if s in ("SELL", "BUY"):
+            return s
+        if s in ("BO", "SC", "SS", "BC", "COVER", "OPEN", "CXL", ""):
+            pass
+        qty = get_num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"))
+        if qty < 0: return "SELL"
+        if qty > 0: return "BUY"
+        return None
+
+    # ---- query vector ----
+    ns = "trading"
+    vec = embed_query("SHORT trades SELL BUY cover quantity price FIFO realized PnL B/S side breakdown legs")
+    res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
+    matches = getattr(res, "matches", []) or []
+
+    # ---- FIFO per symbol; store full lot info so we can emit legs later ----
+    open_lots: Dict[str, List[Dict[str, Any]]] = {}
+    legs: List[Dict[str, Any]] = []
+    rows_scanned = 0
+    trades_used = 0
+
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+        if file and str(md.get("file", "")).strip() != (file or "").strip():
+            continue
+
+        dstr = str(md.get("date", "")).strip()
+        if not dstr or not in_range(dstr):
+            continue
+
+        if get_type(md) != "SHORT":
+            continue
+
+        sym = get_symbol(md)
+        if not sym or sym == "MARKET":
+            continue
+
+        side = infer_side(md)
+        if side not in ("SELL", "BUY"):
+            continue
+
+        qty = get_num(md.get("Quantity"), md.get("Qty"), md.get("quantity"), md.get("qty"))
+        price = get_num(md.get("Price"), md.get("price"))
+        if qty == 0 or price == 0:
+            continue
+
+        rows_scanned += 1
+
+        if sym not in open_lots:
+            open_lots[sym] = []
+
+        if side == "SELL":
+            open_lots[sym].append({
+                "shares": int(abs(qty)),
+                "price": float(price),
+                "date": dstr,
+            })
+            trades_used += 1
+        else:
+            cover = int(abs(qty))
+            trades_used += 1
+
+            lots = open_lots[sym]
+            i = 0
+            while cover > 0 and i < len(lots):
+                lot = lots[i]
+                match_shares = min(cover, lot["shares"])
+                pnl = (lot["price"] - price) * match_shares  # short PnL
+                legs.append({
+                    "symbol": sym,
+                    "shares": match_shares,
+                    "open_date": lot["date"],
+                    "open_price": lot["price"],
+                    "cover_date": dstr,
+                    "cover_price": float(price),
+                    "pnl": round(pnl, 2),
+                })
+                lot["shares"] -= match_shares
+                cover -= match_shares
+                if lot["shares"] == 0:
+                    lots.pop(i)
+                else:
+                    i += 1
+
+    # sort by cover_date then symbol for readability
+    def _key(l):
+        return (l["cover_date"], l["symbol"])
+    legs.sort(key=_key)
+
+    total_pnl = round(sum(l["pnl"] for l in legs), 2)
+    out = {
+        "ok": True,
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "top_k": top_k,
+            "file": file,
+            "namespace": ns,
+        },
+        "rows_scanned": rows_scanned,
+        "trades_used": trades_used,
+        "legs_count": len(legs),
+        "total_realized_pnl": total_pnl,
+        "legs": legs[: max(0, int(limit))],
+    }
+    # If we truncated, include a hint
+    if len(legs) > out["legs_count"]:
+        out["truncated"] = True
+    return out
     
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
 
