@@ -505,7 +505,24 @@ def fees_rollup(
         "pretty": "\n".join(pretty)
     }
 
-# ==== /short_pnl ====
+# ==== /short_pnl (aligned with breakdown matching) ====
+
+from pydantic import BaseModel
+from typing import Optional, Dict, List, Any, Tuple
+
+def _short_key(date_str: str) -> Tuple:
+    """
+    Sort key: (parsed_date, SELL-first flag)
+    We put SELL before BUY when the timestamp is identical so that opens precede covers.
+    """
+    d = _parse_any_date(date_str)
+    # SELL should come before BUY on same timestamp -> SELL gets 0, BUY gets 1
+    def bs_rank(bs: str) -> int:
+        bsu = (bs or "").upper()
+        return 0 if bsu == "SELL" else (1 if bsu == "BUY" else 2)
+    # We'll return a callable; actual bs passed later. We handle bs in the sort by composing keys.
+    return (d or _parse_any_date("1900-01-01")),  # base date part, we’ll extend per-row
+
 def _short_pnl_core(
     start_date: Optional[str],
     end_date: Optional[str],
@@ -514,45 +531,48 @@ def _short_pnl_core(
     authorization: Optional[str],
 ):
     """
-    Realized P&L for SHORT trades (FIFO) with correct window semantics:
-      - Consider *opens* (SELL) with date <= end_date (so prior opens are included).
-      - Consider *covers* (BUY) only if start_date <= date <= end_date.
-      - PnL realized only when a BUY in the window matches prior/open SELL lots.
+    Realized P&L for SHORT trades (FIFO), aligned with breakdown behavior:
+      - Only rows where type == "Short"
+      - SELL = open short (qty < 0)
+      - BUY  = cover (qty > 0)
+      - Symbol required, not MARKET
+      - Date window: include BUY (cover) rows that occur within [start_date, end_date],
+        but allow SELL opens from *before* the window so they can be matched.
+      - Tie-break on identical timestamps: SELL rows are processed before BUY rows.
+      - PnL per match = (open_price - cover_price) * matched_shares
     """
     _check_bearer(authorization)
 
-    # Parse dates
     start_dt = _parse_any_date(start_date) if start_date else None
     end_dt   = _parse_any_date(end_date)   if end_date   else None
 
-    def is_cover_in_window(dstr: str) -> bool:
+    def in_window(dstr: str) -> bool:
+        if not (start_dt or end_dt):
+            return True
         d = _parse_any_date(dstr)
         if not d:
             return False
-        if start_dt and d < start_dt:
-            return False
-        if end_dt and d > end_dt:
-            return False
+        if start_dt and d < start_dt: return False
+        if end_dt   and d > end_dt:   return False
         return True
 
-    def is_open_eligible(dstr: str) -> bool:
-        # allow opens up to the window end (or always if no end bound)
+    def before_window(dstr: str) -> bool:
+        if not start_dt:
+            return False
         d = _parse_any_date(dstr)
-        if not d:
-            return False
-        if end_dt and d > end_dt:
-            return False
-        return True
+        return bool(d and d < start_dt)
 
     ns = "trading"
-    # Broad probe to retrieve short trade rows
+    # Broad semantic probe to retrieve short trade rows
     vec = embed_query("short trades SELL BUY cover quantity price FIFO realized pnl")
     res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
-    # Collect candidate rows, separating opens and covers with the new rules
-    opens:  List[Dict[str, Any]] = []
-    covers: List[Dict[str, Any]] = []
+    # Buffers
+    prewindow_opens: Dict[str, List[Dict[str, Any]]] = {}   # opens before start_dt
+    inwindow_rows: List[Dict[str, Any]] = []                # rows within window (SELL/BUY)
+    rows_scanned = 0
+    trades_used = 0
 
     def getf(v, default=0.0) -> float:
         if v is None:
@@ -564,8 +584,7 @@ def _short_pnl_core(
         except Exception:
             return float(default)
 
-    rows_scanned = 0
-
+    # Pass 1: collect
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
 
@@ -578,15 +597,20 @@ def _short_pnl_core(
         if t != "short":
             continue
 
-        # Required fields
-        dstr = str(md.get("date") or "").strip()
-        bs   = str(md.get("bs") or md.get("B/S") or "").strip().upper()
-        sym  = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
-        qty  = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"), 0.0)
-        price = getf(md.get("price") or md.get("Price"), 0.0)
-
-        if not dstr or bs not in ("SELL", "BUY") or not sym or sym == "MARKET":
+        dstr = str(md.get("date", "")).strip()
+        if not dstr:
             continue
+
+        bs = str(md.get("bs") or md.get("B/S") or "").strip().upper()
+        if bs not in ("SELL", "BUY"):
+            continue
+
+        sym = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
+        if not sym or sym == "MARKET":
+            continue
+
+        qty = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"), 0.0)
+        price = getf(md.get("price") or md.get("Price"), 0.0)
         if qty == 0.0 or price == 0.0:
             continue
 
@@ -596,70 +620,77 @@ def _short_pnl_core(
             "date": dstr,
             "bs": bs,
             "symbol": sym,
-            "qty": qty,
-            "price": price,
+            "qty": float(qty),
+            "price": float(price),
         }
 
-        if bs == "SELL":
-            # Entry lots are eligible if they occur on/before end_date
-            if is_open_eligible(dstr):
-                opens.append(row)
-        else:  # BUY
-            # Covers must be inside the requested window
-            if is_cover_in_window(dstr):
-                covers.append(row)
+        if start_dt and before_window(dstr):
+            # Only keep SELL rows (opens) from before the window
+            if bs == "SELL":
+                prewindow_opens.setdefault(sym, []).append({
+                    "shares": int(abs(qty)),
+                    "price": float(price),
+                    "date": dstr,
+                })
+                trades_used += 1
+        else:
+            # Rows that are >= start_dt (or no start_dt set): keep both SELL and BUY
+            inwindow_rows.append(row)
 
-    # Sort both opens and covers chronologically (stable order for FIFO)
-    def sort_key(r): 
-        d = _parse_any_date(r["date"])
-        return (d or datetime.date.min, r["symbol"])
-    opens.sort(key=sort_key)
-    covers.sort(key=sort_key)
+    # Sort in-window rows by (date, SELL-before-BUY)
+    def sort_key(r):
+        d = _parse_any_date(r["date"]) or _parse_any_date("1900-01-01")
+        bs_rank = 0 if r["bs"] == "SELL" else 1  # SELL first when same timestamp
+        return (d, bs_rank)
 
-    # FIFO state
-    open_lots: Dict[str, List[Dict[str, Any]]] = {}
-    for r in opens:
-        sym = r["symbol"]
+    inwindow_rows.sort(key=sort_key)
+
+    # Build FIFO per symbol, seeded with pre-window opens
+    open_lots: Dict[str, List[Dict[str, Any]]] = {s: list(lots) for s, lots in prewindow_opens.items()}
+    realized_by_symbol: Dict[str, float] = {}
+
+    # Pass 2: process in-window rows.
+    for r in inwindow_rows:
+        dstr = r["date"]
+        bs   = r["bs"]
+        sym  = r["symbol"]
+        qty  = int(abs(r["qty"]))
+        price= float(r["price"])
+
+        # initialize
         if sym not in open_lots:
             open_lots[sym] = []
-        open_lots[sym].append({
-            "shares": int(abs(r["qty"])),  # store positive
-            "price": float(r["price"]),
-            "date":  r["date"],
-        })
-
-    realized_by_symbol: Dict[str, float] = {}
-    trades_used = 0
-
-    # Apply covers against existing/open lots
-    for r in covers:
-        sym = r["symbol"]
-        price = float(r["price"])
-        cover = int(abs(r["qty"]))
-        trades_used += 1
-
-        lots = open_lots.get(sym, [])
         if sym not in realized_by_symbol:
             realized_by_symbol[sym] = 0.0
 
-        i = 0
-        while cover > 0 and i < len(lots):
-            lot = lots[i]
-            match_shares = min(cover, lot["shares"])
-            pnl = (lot["price"] - price) * match_shares
-            realized_by_symbol[sym] += pnl
+        if bs == "SELL":
+            # Only count SELLs as 'used' if they occur in the window; pre-window already counted above.
+            if in_window(dstr):
+                open_lots[sym].append({"shares": qty, "price": price, "date": dstr})
+                trades_used += 1
+        else:  # BUY
+            # Only match BUY covers that are inside the window
+            if not in_window(dstr):
+                continue
+            cover = qty
+            trades_used += 1
 
-            lot["shares"] -= match_shares
-            cover -= match_shares
-            if lot["shares"] == 0:
-                lots.pop(i)
-            else:
-                i += 1
-        # unmatched cover shares (if any) are ignored
+            lots = open_lots[sym]
+            i = 0
+            while cover > 0 and i < len(lots):
+                lot = lots[i]
+                match_shares = min(cover, lot["shares"])
+                pnl = (lot["price"] - price) * match_shares
+                realized_by_symbol[sym] += pnl
 
-        open_lots[sym] = lots
+                lot["shares"] -= match_shares
+                cover -= match_shares
+                if lot["shares"] == 0:
+                    lots.pop(i)
+                else:
+                    i += 1
+            # If cover > 0 remains, unmatched cover; ignore excess.
 
-    # Prepare outputs
     realized_list = [
         {"symbol": s, "realized_pnl": round(v, 2)}
         for s, v in realized_by_symbol.items()
@@ -668,38 +699,27 @@ def _short_pnl_core(
     realized_list.sort(key=lambda x: x["realized_pnl"], reverse=True)
     total_realized = round(sum(x["realized_pnl"] for x in realized_list), 2)
 
+    # Some debug counts to sanity-check behavior
+    opens_used = sum(len(v) for v in open_lots.values()) + sum(len(v) for v in prewindow_opens.values())
+
     return {
         "filters": {
             "start_date": start_date,
             "end_date": end_date,
             "top_k": top_k,
             "file": file,
-            "namespace": ns,
+            "namespace": ns
         },
         "rows_scanned": rows_scanned,
         "trades_used": trades_used,
-        "total_realized_pnl": total_realized,
-        "sample": realized_list[:5],
-        "realized_by_symbol": realized_list,
         "debug_counts": {
-            "opens_used": sum(len(v) for v in open_lots.values()) + 0,  # remaining after covers
-            "covers_in_window": len(covers),
-            "opens_seen_pre_match": len(opens),
+            "opens_used": opens_used
         },
+        "total_realized_pnl": total_realized,
+        "realized_by_symbol": realized_list,
+        "sample": realized_list[:10],
     }
 
-# GET endpoint (query params)
-@app.get("/short_pnl")
-def short_pnl_get(
-    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
-    top_k: int                = Query(5000, description="How many rows to scan"),
-    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
-    authorization: Optional[str] = Header(default=None),
-):
-    return _short_pnl_core(start_date, end_date, top_k, file, authorization)
-
-# POST endpoint (JSON body)
 class ShortPnlBody(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
@@ -711,9 +731,23 @@ def short_pnl_post(
     body: ShortPnlBody,
     authorization: Optional[str] = Header(default=None),
 ):
-    return _short_pnl_core(body.start_date, body.end_date, body.top_k, body.file, authorization)
+    return _short_pnl_core(
+        start_date=body.start_date,
+        end_date=body.end_date,
+        top_k=body.top_k,
+        file=body.file,
+        authorization=authorization,
+    )
 
-
+@app.get("/short_pnl")
+def short_pnl_get(
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date:   Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    top_k:      int = Query(5000, description="How many rows to scan"),
+    file:       Optional[str] = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
+    authorization: Optional[str] = Header(default=None),
+):
+    return _short_pnl_core(start_date, end_date, top_k, file, authorization)
 # ==== /short_pnl_breakdown (SELLs-before-BUYs ordering fix) ====
 
 @app.get("/short_pnl_breakdown")
