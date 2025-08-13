@@ -506,9 +506,6 @@ def fees_rollup(
     }
 
 # ==== /short_pnl ====
-
-from pydantic import BaseModel
-
 def _short_pnl_core(
     start_date: Optional[str],
     end_date: Optional[str],
@@ -517,41 +514,45 @@ def _short_pnl_core(
     authorization: Optional[str],
 ):
     """
-    Realized P&L for SHORT trades (FIFO), using your cleaned trading format:
-      - Only rows where type == "Short" (case-insensitive)
-      - Entry lot: bs == "SELL"  (qty < 0)
-      - Cover lot: bs == "BUY"   (qty > 0)
-      - Symbol must be present and not "MARKET"
-      - PnL per match = (open_price - cover_price) * matched_shares
+    Realized P&L for SHORT trades (FIFO) with correct window semantics:
+      - Consider *opens* (SELL) with date <= end_date (so prior opens are included).
+      - Consider *covers* (BUY) only if start_date <= date <= end_date.
+      - PnL realized only when a BUY in the window matches prior/open SELL lots.
     """
     _check_bearer(authorization)
 
-    # Date window (inclusive)
+    # Parse dates
     start_dt = _parse_any_date(start_date) if start_date else None
     end_dt   = _parse_any_date(end_date)   if end_date   else None
 
-    def in_range(dstr: str) -> bool:
-        if not (start_dt or end_dt):
-            return True
+    def is_cover_in_window(dstr: str) -> bool:
         d = _parse_any_date(dstr)
         if not d:
             return False
-        if start_dt and d < start_dt: return False
-        if end_dt   and d > end_dt:   return False
+        if start_dt and d < start_dt:
+            return False
+        if end_dt and d > end_dt:
+            return False
+        return True
+
+    def is_open_eligible(dstr: str) -> bool:
+        # allow opens up to the window end (or always if no end bound)
+        d = _parse_any_date(dstr)
+        if not d:
+            return False
+        if end_dt and d > end_dt:
+            return False
         return True
 
     ns = "trading"
-    # Broad semantic probe to retrieve short trade rows
+    # Broad probe to retrieve short trade rows
     vec = embed_query("short trades SELL BUY cover quantity price FIFO realized pnl")
     res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
-    # FIFO state
-    open_lots: Dict[str, List[Dict[str, Any]]] = {}   # symbol -> [{shares, price, date}]
-    realized_by_symbol: Dict[str, float] = {}
-
-    rows_scanned = 0
-    trades_used = 0
+    # Collect candidate rows, separating opens and covers with the new rules
+    opens:  List[Dict[str, Any]] = []
+    covers: List[Dict[str, Any]] = []
 
     def getf(v, default=0.0) -> float:
         if v is None:
@@ -563,11 +564,13 @@ def _short_pnl_core(
         except Exception:
             return float(default)
 
+    rows_scanned = 0
+
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
 
         # Optional file filter
-        if file and str(md.get("file", "")).strip() != file.strip():
+        if file and str(md.get("file", "")).strip() != str(file).strip():
             continue
 
         # Must be type Short
@@ -575,63 +578,86 @@ def _short_pnl_core(
         if t != "short":
             continue
 
-        # Date filter
-        dstr = str(md.get("date", "")).strip()
-        if not dstr or not in_range(dstr):
-            continue
-
-        # B/S filter (SELL = entry, BUY = cover); ignore others (SC, BO, etc.)
-        bs = str(md.get("bs") or md.get("B/S") or "").strip().upper()
-        if bs not in ("SELL", "BUY"):
-            continue
-
-        # Symbol required and not MARKET
-        sym = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
-        if not sym or sym == "MARKET":
-            continue
-
-        # Quantity and price must be usable
-        qty = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"), 0.0)
+        # Required fields
+        dstr = str(md.get("date") or "").strip()
+        bs   = str(md.get("bs") or md.get("B/S") or "").strip().upper()
+        sym  = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
+        qty  = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"), 0.0)
         price = getf(md.get("price") or md.get("Price"), 0.0)
+
+        if not dstr or bs not in ("SELL", "BUY") or not sym or sym == "MARKET":
+            continue
         if qty == 0.0 or price == 0.0:
             continue
 
         rows_scanned += 1
 
-        # Buckets
+        row = {
+            "date": dstr,
+            "bs": bs,
+            "symbol": sym,
+            "qty": qty,
+            "price": price,
+        }
+
+        if bs == "SELL":
+            # Entry lots are eligible if they occur on/before end_date
+            if is_open_eligible(dstr):
+                opens.append(row)
+        else:  # BUY
+            # Covers must be inside the requested window
+            if is_cover_in_window(dstr):
+                covers.append(row)
+
+    # Sort both opens and covers chronologically (stable order for FIFO)
+    def sort_key(r): 
+        d = _parse_any_date(r["date"])
+        return (d or datetime.date.min, r["symbol"])
+    opens.sort(key=sort_key)
+    covers.sort(key=sort_key)
+
+    # FIFO state
+    open_lots: Dict[str, List[Dict[str, Any]]] = {}
+    for r in opens:
+        sym = r["symbol"]
         if sym not in open_lots:
             open_lots[sym] = []
+        open_lots[sym].append({
+            "shares": int(abs(r["qty"])),  # store positive
+            "price": float(r["price"]),
+            "date":  r["date"],
+        })
+
+    realized_by_symbol: Dict[str, float] = {}
+    trades_used = 0
+
+    # Apply covers against existing/open lots
+    for r in covers:
+        sym = r["symbol"]
+        price = float(r["price"])
+        cover = int(abs(r["qty"]))
+        trades_used += 1
+
+        lots = open_lots.get(sym, [])
         if sym not in realized_by_symbol:
             realized_by_symbol[sym] = 0.0
 
-        if bs == "SELL":
-            # entry lot (store positive shares for convenience)
-            open_lots[sym].append({
-                "shares": int(abs(qty)),
-                "price": float(price),
-                "date": dstr,
-            })
-            trades_used += 1
-        else:  # bs == "BUY"
-            # cover lot: FIFO match against open lots
-            cover = int(abs(qty))
-            trades_used += 1
+        i = 0
+        while cover > 0 and i < len(lots):
+            lot = lots[i]
+            match_shares = min(cover, lot["shares"])
+            pnl = (lot["price"] - price) * match_shares
+            realized_by_symbol[sym] += pnl
 
-            lots = open_lots[sym]
-            i = 0
-            while cover > 0 and i < len(lots):
-                lot = lots[i]
-                match_shares = min(cover, lot["shares"])
-                pnl = (lot["price"] - price) * match_shares
-                realized_by_symbol[sym] += pnl
+            lot["shares"] -= match_shares
+            cover -= match_shares
+            if lot["shares"] == 0:
+                lots.pop(i)
+            else:
+                i += 1
+        # unmatched cover shares (if any) are ignored
 
-                lot["shares"] -= match_shares
-                cover -= match_shares
-                if lot["shares"] == 0:
-                    lots.pop(i)
-                else:
-                    i += 1
-            # If cover > 0 remains, it's an unmatched cover; ignore the excess.
+        open_lots[sym] = lots
 
     # Prepare outputs
     realized_list = [
@@ -640,7 +666,6 @@ def _short_pnl_core(
         if abs(v) > 1e-9
     ]
     realized_list.sort(key=lambda x: x["realized_pnl"], reverse=True)
-
     total_realized = round(sum(x["realized_pnl"] for x in realized_list), 2)
 
     return {
@@ -649,13 +674,18 @@ def _short_pnl_core(
             "end_date": end_date,
             "top_k": top_k,
             "file": file,
-            "namespace": ns
+            "namespace": ns,
         },
         "rows_scanned": rows_scanned,
         "trades_used": trades_used,
         "total_realized_pnl": total_realized,
         "sample": realized_list[:5],
-        "realized_by_symbol": realized_list
+        "realized_by_symbol": realized_list,
+        "debug_counts": {
+            "opens_used": sum(len(v) for v in open_lots.values()) + 0,  # remaining after covers
+            "covers_in_window": len(covers),
+            "opens_seen_pre_match": len(opens),
+        },
     }
 
 # GET endpoint (query params)
