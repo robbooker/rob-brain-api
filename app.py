@@ -734,7 +734,11 @@ def short_pnl_get(
     authorization: Optional[str] = Header(default=None),
 ):
     return _short_pnl_core(start_date, end_date, top_k, file, authorization)
-# ==== /short_pnl_breakdown (SELLs-before-BUYs ordering fix) ====
+    
+# ==== /short_pnl_breakdown ====
+
+from typing import Optional, Dict, Any, List
+from fastapi import Query, Header
 
 @app.get("/short_pnl_breakdown")
 def short_pnl_breakdown(
@@ -742,22 +746,20 @@ def short_pnl_breakdown(
     end_date:   Optional[str] = Query(None, description="End date YYYY-MM-DD"),
     top_k:      int = Query(5000, description="How many rows to scan"),
     file:       Optional[str] = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
-    limit:      int = Query(20000, description="Max legs to return"),
+    limit:      int = Query(50000, description="Max legs to return"),
+    symbol:     Optional[str] = Query(None, description="If provided, only return legs for this symbol (case-insensitive)"),
     authorization: Optional[str] = Header(default=None),
 ):
     """
-    Breakdown of realized P&L legs for SHORT trades (FIFO) within the window.
-    IMPORTANT: For shorts, we force intra-day ordering: SELL rows are processed
-    before BUY rows on the same date. This prevents a cover from being matched
-    before its open if rows are retrieved out-of-order from the vector DB.
+    FIFO breakdown of realized P&L for SHORT trades (SELL opens, BUY covers).
+    New: optional `symbol` filter to return only legs for a specific ticker.
     """
     _check_bearer(authorization)
 
-    # Parse date window (inclusive)
     start_dt = _parse_any_date(start_date) if start_date else None
     end_dt   = _parse_any_date(end_date)   if end_date   else None
 
-    def in_window(dstr: str) -> bool:
+    def in_range(dstr: str) -> bool:
         if not (start_dt or end_dt):
             return True
         d = _parse_any_date(dstr)
@@ -767,16 +769,20 @@ def short_pnl_breakdown(
         if end_dt   and d > end_dt:   return False
         return True
 
-    ns  = "trading"
-    qv  = embed_query("short trades SELL BUY cover quantity price FIFO realized pnl legs breakdown")
-    res = index.query(vector=qv, top_k=top_k, namespace=ns, include_metadata=True)
+    ns = "trading"
+    qvec = embed_query("short trades SELL BUY cover quantity price FIFO realized pnl legs breakdown")
+    res  = index.query(vector=qvec, top_k=top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
-    # Collect candidate rows (window-filtered) and normalize fields
-    rows = []
+    # State
+    open_lots: Dict[str, List[Dict[str, Any]]] = {}   # per symbol FIFO lots
+    legs: List[Dict[str, Any]] = []
     rows_scanned = 0
+    trades_used  = 0
 
-    def fnum(v, default=0.0):
+    want_symbol = symbol.upper().strip() if symbol else None
+
+    def getf(v, default=0.0) -> float:
         if v is None:
             return float(default)
         try:
@@ -786,24 +792,24 @@ def short_pnl_breakdown(
         except Exception:
             return float(default)
 
+    # Build opens from ALL history up to end_dt so covers in-window can consume them
+    # and then create legs ONLY for covers that are in the [start_dt, end_dt] window.
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
 
-        # Optional file filter
+        # File filter
         if file and str(md.get("file", "")).strip() != file.strip():
             continue
 
-        # Must be type Short
+        # Must be Short
         t = str(md.get("type") or md.get("Type") or "").strip().lower()
         if t != "short":
             continue
 
-        # Date in window
         dstr = str(md.get("date", "")).strip()
-        if not dstr or not in_window(dstr):
+        if not dstr:
             continue
 
-        # B/S must be SELL (open short) or BUY (cover)
         bs = str(md.get("bs") or md.get("B/S") or "").strip().upper()
         if bs not in ("SELL", "BUY"):
             continue
@@ -812,80 +818,91 @@ def short_pnl_breakdown(
         if not sym or sym == "MARKET":
             continue
 
-        qty   = fnum(md.get("qty") or md.get("Quantity") or md.get("Qty"), 0.0)
-        price = fnum(md.get("price") or md.get("Price"), 0.0)
+        # optional symbol filter (applies to both opens and covers so FIFO is consistent)
+        if want_symbol and sym != want_symbol:
+            continue
+
+        qty   = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"))
+        price = getf(md.get("price") or md.get("Price"))
         if qty == 0.0 or price == 0.0:
             continue
 
-        rows_scanned += 1
-        rows.append({
-            "date_str": dstr,
-            "date": _parse_any_date(dstr),  # datetime for sorting
-            "bs": bs,
-            "symbol": sym,
-            "qty": qty,
-            "price": price,
-            "file": md.get("file", "")
-        })
-
-    # --- CRITICAL ORDERING FIX ---
-    # Sort by (date ASC, symbol ASC, bs_rank ASC, then absolute qty DESC to match larger chunks first)
-    # For shorts: SELL (opens) must be processed before BUY (covers) on the same day.
-    def bs_rank(bs: str) -> int:
-        return 0 if bs == "SELL" else 1  # SELL first, then BUY
-
-    rows.sort(key=lambda r: (
-        r["date"] or _parse_any_date("1900-01-01"),
-        r["symbol"],
-        bs_rank(r["bs"]),
-        -abs(r["qty"])
-    ))
-
-    # FIFO per symbol
-    open_lots: Dict[str, List[Dict[str, Any]]] = {}  # [{shares, price, date}]
-    legs: List[Dict[str, Any]] = []
-    trades_used = 0
-
-    for r in rows:
-        sym, bs, qty, price, dstr = r["symbol"], r["bs"], r["qty"], r["price"], r["date_str"]
-
-        if sym not in open_lots:
-            open_lots[sym] = []
-
+        # If this is an OPEN (SELL), we must admit it if it is <= end_dt (to be available to any in-window cover),
+        # regardless of whether it's before start_dt.
         if bs == "SELL":
-            # Short entry (store positive share count)
-            open_lots[sym].append({"shares": int(abs(qty)), "price": float(price), "date": dstr})
-            trades_used += 1
-        else:  # BUY cover
-            cover = int(abs(qty))
-            i = 0
-            while cover > 0 and i < len(open_lots[sym]):
-                lot = open_lots[sym][i]
-                match_shares = min(cover, lot["shares"])
-                pnl = (lot["price"] - price) * match_shares
-                legs.append({
-                    "symbol": sym,
-                    "shares": match_shares,
-                    "open_date": lot["date"],
-                    "open_price": lot["price"],
-                    "cover_date": dstr,
-                    "cover_price": float(price),
-                    "pnl": round(pnl, 2),
-                    "file": r["file"]
-                })
-                lot["shares"] -= match_shares
-                cover -= match_shares
-                if lot["shares"] == 0:
-                    open_lots[sym].pop(i)
-                else:
-                    i += 1
-            trades_used += 1
-            # Any remaining unmatched cover is ignored (no open lot).
+            # SELL is an OPEN if it is before or on end_dt, otherwise it can't feed in-window covers.
+            if end_dt is None or in_range(dstr) or (_parse_any_date(dstr) and _parse_any_date(dstr) <= end_dt):
+                rows_scanned += 1
+                if sym not in open_lots:
+                    open_lots[sym] = []
+                open_lots[sym].append({"shares": int(abs(qty)), "price": float(price), "date": dstr, "file": md.get("file")})
+                trades_used += 1
 
-    total_realized = round(sum(l["pnl"] for l in legs), 2)
+    # Second pass: process BUY covers that are within the in-window range and match FIFO from open_lots
+    for m in matches:
+        md = getattr(m, "metadata", {}) or {}
+        if file and str(md.get("file", "")).strip() != file.strip():
+            continue
 
-    # Limit the response size if requested
-    legs_out = legs if limit <= 0 else legs[:limit]
+        t = str(md.get("type") or md.get("Type") or "").strip().lower()
+        if t != "short":
+            continue
+
+        dstr = str(md.get("date", "")).strip()
+        if not dstr or not in_range(dstr):
+            continue
+
+        bs = str(md.get("bs") or md.get("B/S") or "").strip().upper()
+        if bs != "BUY":
+            continue
+
+        sym = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
+        if not sym or sym == "MARKET":
+            continue
+
+        if want_symbol and sym != want_symbol:
+            continue
+
+        qty   = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"))
+        price = getf(md.get("price") or md.get("Price"))
+        if qty <= 0.0 or price == 0.0:
+            continue
+
+        rows_scanned += 1
+        cover = int(abs(qty))
+        trades_used += 1
+
+        lots = open_lots.get(sym, [])
+        i = 0
+        while cover > 0 and i < len(lots):
+            lot = lots[i]
+            match_shares = min(cover, lot["shares"])
+            pnl = (lot["price"] - price) * match_shares
+            legs.append({
+                "symbol": sym,
+                "shares": match_shares,
+                "open_date": lot["date"],
+                "open_price": lot["price"],
+                "cover_date": dstr,
+                "cover_price": float(price),
+                "pnl": round(pnl, 2),
+                "file": md.get("file"),
+            })
+
+            lot["shares"] -= match_shares
+            cover -= match_shares
+            if lot["shares"] == 0:
+                lots.pop(i)
+            else:
+                i += 1
+
+    # Optional symbol filtering at the very end (double-safety)
+    if want_symbol:
+        legs = [leg for leg in legs if leg["symbol"] == want_symbol]
+
+    legs = legs[:max(0, int(limit))]
+    total_realized = round(sum(leg["pnl"] for leg in legs), 2)
+    symbol_total = total_realized if want_symbol else None
 
     return {
         "ok": True,
@@ -894,13 +911,15 @@ def short_pnl_breakdown(
             "end_date": end_date,
             "top_k": top_k,
             "file": file,
-            "namespace": ns
+            "namespace": ns,
+            "symbol": want_symbol,
         },
         "rows_scanned": rows_scanned,
         "trades_used": trades_used,
         "legs_count": len(legs),
         "total_realized_pnl": total_realized,
-        "legs": legs_out
+        "symbol_total_realized_pnl": symbol_total,
+        "legs": legs,
     }
     
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
