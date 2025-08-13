@@ -838,6 +838,58 @@ def short_pnl_breakdown(
                 open_lots[sym].append({"shares": int(abs(qty)), "price": float(price), "date": dstr, "file": md.get("file")})
                 trades_used += 1
 
+        # --- PRE-WINDOW RECONCILIATION ---
+    # Consume any covers BEFORE the start date so boundary inventory is correct.
+    if start_dt is not None:
+        for m in matches:
+            md = getattr(m, "metadata", {}) or {}
+
+            # Same filters as elsewhere
+            if file and str(md.get("file", "")).strip() != file.strip():
+                continue
+            t = str(md.get("type") or md.get("Type") or "").strip().lower()
+            if t != "short":
+                continue
+            dstr = str(md.get("date", "")).strip()
+            if not dstr:
+                continue
+            d = _parse_any_date(dstr)
+            if not d or d >= start_dt:   # only pre-window covers
+                continue
+
+            bs = str(md.get("bs") or md.get("B/S") or "").strip().upper()
+            if bs != "BUY":
+                continue
+
+            sym = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
+            if not sym or sym == "MARKET":
+                continue
+            if want_symbol and sym != want_symbol:
+                continue
+
+            qty   = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"))
+            price = getf(md.get("price") or md.get("Price"))
+            if qty <= 0.0 or price == 0.0:
+                continue
+
+            # consume lots without emitting a leg or PnL
+            rows_scanned += 1
+            trades_used  += 1
+            cover = int(abs(qty))
+
+            lots = open_lots.get(sym, [])
+            i = 0
+            while cover > 0 and i < len(lots):
+                lot = lots[i]
+                match_shares = min(cover, lot["shares"])
+                lot["shares"] -= match_shares
+                cover -= match_shares
+                if lot["shares"] == 0:
+                    lots.pop(i)
+                else:
+                    i += 1
+            # any remaining 'cover' was unmatched pre-window; ignore
+    
     # Second pass: process BUY covers that are within the in-window range and match FIFO from open_lots
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
