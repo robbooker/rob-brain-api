@@ -507,13 +507,14 @@ def fees_rollup(
 
 # ==== /short_pnl ====
 
-@app.post("/short_pnl")
-def short_pnl(
-    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date:   Optional[str] = Query(None, description="End date YYYY-MM-DD"),
-    top_k:      int = Query(5000, description="How many rows to scan"),
-    file:       Optional[str] = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
-    authorization: Optional[str] = Header(default=None),
+from pydantic import BaseModel
+
+def _short_pnl_core(
+    start_date: Optional[str],
+    end_date: Optional[str],
+    top_k: int,
+    file: Optional[str],
+    authorization: Optional[str],
 ):
     """
     Realized P&L for SHORT trades (FIFO), using your cleaned trading format:
@@ -611,7 +612,7 @@ def short_pnl(
                 "date": dstr,
             })
             trades_used += 1
-        elif bs == "BUY":
+        else:  # bs == "BUY"
             # cover lot: FIFO match against open lots
             cover = int(abs(qty))
             trades_used += 1
@@ -630,7 +631,7 @@ def short_pnl(
                     lots.pop(i)
                 else:
                     i += 1
-            # If cover > 0 remains, it's an unmatched cover; we ignore the excess.
+            # If cover > 0 remains, it's an unmatched cover; ignore the excess.
 
     # Prepare outputs
     realized_list = [
@@ -657,7 +658,7 @@ def short_pnl(
         "realized_by_symbol": realized_list
     }
 
-# GET alias (query params) calls the same core
+# GET endpoint (query params)
 @app.get("/short_pnl")
 def short_pnl_get(
     start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
@@ -667,6 +668,21 @@ def short_pnl_get(
     authorization: Optional[str] = Header(default=None),
 ):
     return _short_pnl_core(start_date, end_date, top_k, file, authorization)
+
+# POST endpoint (JSON body)
+class ShortPnlBody(BaseModel):
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    top_k: int = 5000
+    file: Optional[str] = None
+
+@app.post("/short_pnl")
+def short_pnl_post(
+    body: ShortPnlBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    return _short_pnl_core(body.start_date, body.end_date, body.top_k, body.file, authorization)
+
 
 # ==== /short_pnl_breakdown (list each matched FIFO leg) ====
 
@@ -839,7 +855,7 @@ def short_pnl_breakdown(
     if len(legs) > out["legs_count"]:
         out["truncated"] = True
     return out
-    
+
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
 
 @app.get("/shorts_over_price")
