@@ -716,31 +716,31 @@ def short_pnl_post(
 
 # ==== /short_pnl_breakdown ====
 
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
+from fastapi import Query, Header
 
-def _short_pnl_breakdown_core(
-    start_date: Optional[str],
-    end_date: Optional[str],
-    top_k: int,
-    file: Optional[str],
-    limit: int,
-    authorization: Optional[str],
+@app.get("/short_pnl_breakdown")
+def short_pnl_breakdown(
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date:   Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    top_k:      int = Query(5000, description="How many rows to scan"),
+    file:       Optional[str] = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
+    limit:      int = Query(1000, description="Max legs to return (after building)"),
+    authorization: Optional[str] = Header(default=None),
 ):
     """
-    Trade-level FIFO breakdown for SHORT trades within a date window.
+    Build explicit FIFO legs for Short trades.
 
-    Rules (using your cleaned CSV -> vector metadata):
-      - Only rows where type == "Short" (case-insensitive)
-      - Entry lots: bs == "SELL"   (qty < 0)
-      - Cover lots: bs == "BUY"    (qty > 0)
-      - Ignore all other bs codes (SC, BO, etc.)
-      - Symbol required and not "MARKET"
-      - PnL per matched leg: (open_price - cover_price) * matched_shares
+    Rules:
+      - type == "Short"
+      - bs  == "SELL" opens (qty < 0), bs == "BUY" covers (qty > 0)
+      - symbol present and not "MARKET"
+      - deterministic ordering: sort by (date, SELL before BUY) so same-day opens
+        are always available before same-day covers.
     """
     _check_bearer(authorization)
 
-    # Parse date window (inclusive)
+    # Date window (inclusive)
     start_dt = _parse_any_date(start_date) if start_date else None
     end_dt   = _parse_any_date(end_date)   if end_date   else None
 
@@ -754,21 +754,6 @@ def _short_pnl_breakdown_core(
         if end_dt   and d > end_dt:   return False
         return True
 
-    ns = "trading"
-    vec = embed_query("short trades SELL BUY cover quantity price FIFO realized pnl")
-    res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
-    matches = getattr(res, "matches", []) or []
-
-    # Per-symbol FIFO queue of open short lots
-    #   open_lots[sym] = [ {shares:int, price:float, date:str}, ... ]
-    open_lots: Dict[str, List[Dict[str, Any]]] = {}
-
-    # Legs produced when a BUY matches an earlier SELL
-    legs: List[Dict[str, Any]] = []
-
-    rows_scanned = 0
-    trades_used = 0
-
     def getf(v, default=0.0) -> float:
         if v is None:
             return float(default)
@@ -779,104 +764,121 @@ def _short_pnl_breakdown_core(
         except Exception:
             return float(default)
 
-    # We want deterministic FIFO across the window, so iterate in date order.
-    # Not all vector stores return sorted results; sort by date string parsed.
-    def parse_date_key(md: Dict[str, Any]):
-        d = _parse_any_date(str(md.get("date", "")).strip())
-        # tie-breaker on symbol to stabilize ordering
-        sym = str(md.get("symbol") or md.get("Symbol") or "")
-        return (d or _parse_any_date("1900-01-01"), sym)
+    # Pull candidates from Pinecone
+    ns = "trading"
+    vec = embed_query("short trades SELL BUY cover quantity price FIFO legs realized pnl")
+    res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
+    matches = getattr(res, "matches", []) or []
 
-    # Pull metadata objects and sort them
-    md_list: List[Dict[str, Any]] = []
+    # Normalize & filter rows we can actually use
+    rows: List[Dict[str, Any]] = []
+    rows_scanned = 0
+
     for m in matches:
-        md = (getattr(m, "metadata", {}) or {})
-        md_list.append(md)
-    md_list.sort(key=parse_date_key)
+        md = getattr(m, "metadata", {}) or {}
 
-    for md in md_list:
-        # Optional: restrict to a specific uploaded CSV
         if file and str(md.get("file", "")).strip() != file.strip():
             continue
 
-        # Must be type Short
         t = str(md.get("type") or md.get("Type") or "").strip().lower()
         if t != "short":
             continue
 
-        # Date filter
         dstr = str(md.get("date", "")).strip()
         if not dstr or not in_range(dstr):
             continue
 
-        # B/S filter
         bs = str(md.get("bs") or md.get("B/S") or "").strip().upper()
         if bs not in ("SELL", "BUY"):
             continue
 
-        # Symbol required and not MARKET
         sym = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
         if not sym or sym == "MARKET":
             continue
 
-        # Quantity & price
         qty = getf(md.get("qty") or md.get("Quantity") or md.get("Qty"), 0.0)
         price = getf(md.get("price") or md.get("Price"), 0.0)
         if qty == 0.0 or price == 0.0:
             continue
 
+        # keep normalized copy (store positive shares separately)
+        rows.append({
+            "date_str": dstr,
+            "date": _parse_any_date(dstr),
+            "bs": bs,
+            "symbol": sym,
+            "price": float(price),
+            "qty": float(qty),  # signed in source
+            "file": md.get("file"),
+        })
         rows_scanned += 1
 
-        # Ensure symbol bucket
+    # Deterministic order:
+    #   - primary: date ascending
+    #   - secondary: SELL (0) before BUY (1) on the same date
+    def bs_order(x: str) -> int:
+        return 0 if x == "SELL" else 1
+
+    rows.sort(key=lambda r: (r["date"], bs_order(r["bs"])))
+
+    # FIFO match
+    open_lots: Dict[str, List[Dict[str, Any]]] = {}  # sym -> list[{shares, price, date}]
+    legs: List[Dict[str, Any]] = []
+    trades_used = 0
+
+    for r in rows:
+        sym = r["symbol"]
+        bs = r["bs"]
+        date_str = r["date_str"]
+        price = r["price"]
+        qty = r["qty"]
+
+        # init bucket
         if sym not in open_lots:
             open_lots[sym] = []
 
         if bs == "SELL":
-            # Entry: store positive shares
+            # entry: store positive shares
             open_lots[sym].append({
                 "shares": int(abs(qty)),
-                "price": float(price),
-                "date": dstr,
+                "price": price,
+                "date_str": date_str,
             })
             trades_used += 1
-
-        else:  # BUY = cover
+        else:
+            # cover: match against FIFO opens
             cover = int(abs(qty))
-            trades_used += 1
-
-            lots = open_lots[sym]
             i = 0
-            while cover > 0 and i < len(lots):
-                lot = lots[i]
+            while cover > 0 and i < len(open_lots[sym]):
+                lot = open_lots[sym][i]
                 match_shares = min(cover, lot["shares"])
-
                 pnl = (lot["price"] - price) * match_shares
 
                 legs.append({
                     "symbol": sym,
                     "shares": match_shares,
-                    "open_date": lot["date"],
+                    "open_date": lot["date_str"],
                     "open_price": round(lot["price"], 5),
-                    "cover_date": dstr,
-                    "cover_price": round(float(price), 5),
+                    "cover_date": date_str,
+                    "cover_price": round(price, 5),
                     "pnl": round(pnl, 2),
-                    "file": md.get("file", None),
+                    "file": r.get("file"),
                 })
 
-                # reduce lot and remaining cover
                 lot["shares"] -= match_shares
                 cover -= match_shares
-
                 if lot["shares"] == 0:
-                    lots.pop(i)
+                    open_lots[sym].pop(i)
                 else:
                     i += 1
-            # Any remaining cover that doesn't match is ignored (no open lot).
+            trades_used += 1
+            # If cover > 0 remains, unmatched portion is ignored.
 
+    # Totals
     total_realized = round(sum(l["pnl"] for l in legs), 2)
 
-    # Respect limit on returned legs (but compute total from all)
-    legs_out = legs if limit is None else legs[: max(0, int(limit))]
+    # Apply limit AFTER building legs so we don't lose pairs
+    out_legs = legs if limit <= 0 else legs[:limit]
 
     return {
         "ok": True,
@@ -891,47 +893,9 @@ def _short_pnl_breakdown_core(
         "trades_used": trades_used,
         "legs_count": len(legs),
         "total_realized_pnl": total_realized,
-        "legs": legs_out,
+        "legs": out_legs,
     }
-
-class ShortPnlBreakdownBody(BaseModel):
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    top_k: int = 5000
-    file: Optional[str] = None
-    limit: int = 1000  # how many legs to return (total is still computed)
-
-@app.post("/short_pnl_breakdown")
-def short_pnl_breakdown_post(
-    body: ShortPnlBreakdownBody,
-    authorization: Optional[str] = Header(default=None),
-):
-    return _short_pnl_breakdown_core(
-        start_date=body.start_date,
-        end_date=body.end_date,
-        top_k=body.top_k,
-        file=body.file,
-        limit=body.limit,
-        authorization=authorization,
-    )
-
-@app.get("/short_pnl_breakdown")
-def short_pnl_breakdown_get(
-    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
-    end_date: Optional[str]   = Query(None, description="End date YYYY-MM-DD"),
-    top_k: int                = Query(5000, description="How many rows to scan"),
-    file: Optional[str]       = Query(None, description="Optional: restrict to a specific uploaded CSV filename"),
-    limit: int                = Query(1000, description="How many matched legs to return"),
-    authorization: Optional[str] = Header(default=None),
-):
-    return _short_pnl_breakdown_core(
-        start_date=start_date,
-        end_date=end_date,
-        top_k=top_k,
-        file=file,
-        limit=limit,
-        authorization=authorization,
-    )
+    
 # ==== /shorts_over_price (filter SHORT entries by entry/price/date) ====
 
 @app.get("/shorts_over_price")
