@@ -237,13 +237,70 @@ def ask(body: AskBody, authorization: Optional[str] = Header(default=None)):
         "suggested_instruction": "Use the context excerpts to answer the user's question. Cite titles/sources from context. If something is unclear or missing, say so."
     }
 
-# ==== /fees (CSV rollup across common fee columns + borrow/overnight; safe math) ====
+# ==== /fees ====
+
+from typing import Optional, Dict, Any, List
+import re
+
+FEE_COLUMNS = ["TransFee","ECNTaker","ECNMaker","ORFFee","TAFFee","SECFee","CATFee","Commissions"]
+
+def _to_f(x, default=0.0) -> float:
+    if x is None:
+        return float(default)
+    try:
+        if isinstance(x, str):
+            s = x.replace(",", "").replace("$", "").strip()
+            if s == "":
+                return float(default)
+            return float(s)
+        return float(x)
+    except Exception:
+        return float(default)
+
+def _fee_amount_from_md(md: Dict[str, Any]) -> float:
+    """
+    For Borrow/Overnight rows, prefer 'Amount' (signed).
+    Fallback: parse 'Amount:' in text, then fallback to Price if present.
+    """
+    if "Amount" in md or "amount" in md:
+        amt = _to_f(md.get("Amount", md.get("amount")), 0.0)
+        if amt != 0.0:
+            return amt
+    txt = str(md.get("text") or "")
+    m = re.search(r"Amount:\s*([-+]?\$?\s*[0-9][0-9,]*(?:\.[0-9]+)?)", txt, flags=re.I)
+    if m:
+        return _to_f(m.group(1), 0.0)
+    return _to_f(md.get("price") or md.get("Price"), 0.0)
+
+def _tx_sum(md: Dict[str, Any]) -> float:
+    return sum(_to_f(md.get(k), 0.0) for k in FEE_COLUMNS)
+
+def _tx_by_column(md: Dict[str, Any]) -> Dict[str, float]:
+    return {k: _to_f(md.get(k), 0.0) for k in FEE_COLUMNS}
+
 @app.post("/fees")
-def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
+def fees(
+    body: FeesBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Fee accounting:
+      • Transaction fees (row type != Borrow/Overnight): sum fee columns with original signs.
+        Positive values (e.g., ECNMaker rebates) reduce total fees.
+      • Borrow/Overnight fees (row type == Borrow Fee / Overnight Fee): use 'Amount' (signed).
+      • Returns per-column totals, per-symbol totals, and grand totals.
+    """
     _check_bearer(authorization)
 
-    start_dt = _parse_any_date(body.start) if body.start else None
-    end_dt   = _parse_any_date(body.end)   if body.end   else None
+    ns       = body.namespace or "trading"
+    top_k    = body.top_k or 5000
+    file_in  = (body.file or "").strip() or None
+    start    = body.start
+    end      = body.end
+    symbols  = body.symbols or None
+
+    start_dt = _parse_any_date(start) if start else None
+    end_dt   = _parse_any_date(end)   if end else None
 
     def in_range(dstr: str) -> bool:
         if not (start_dt or end_dt):
@@ -255,80 +312,109 @@ def fees(body: FeesBody, authorization: Optional[str] = Header(default=None)):
         if end_dt   and d > end_dt:   return False
         return True
 
-    ns = body.namespace or "trading"
-    # Keep query broad; we filter by file/date below
-    vec = embed_query("broker activity trade rows fee columns borrow overnight")
-    res = index.query(vector=vec, top_k=body.top_k, namespace=ns, include_metadata=True)
+    # Vector fetch
+    qvec = embed_query("fees commissions borrow overnight transaction fee rows amount columns")
+    res  = index.query(vector=qvec, top_k=top_k, namespace=ns, include_metadata=True)
     matches = getattr(res, "matches", []) or []
 
-    fee_cols = ["TransFee", "ECNTaker", "ECNMaker", "ORFFee", "TAFFee", "SECFee", "CATFee", "Commissions"]
-
-    by_col: Dict[str, float] = {c: 0.0 for c in fee_cols}
-    borrow_fees = 0.0
-    overnight_fees = 0.0
     rows_scanned = 0
+
+    # Aggregates
+    by_column_totals: Dict[str, float] = {k: 0.0 for k in FEE_COLUMNS}
+    transaction_by_symbol: Dict[str, float] = {}
+    borrow_by_symbol: Dict[str, float] = {}
+    overnight_by_symbol: Dict[str, float] = {}
+
+    total_borrow = 0.0
+    total_overnight = 0.0
+
+    filtered_rows: List[Dict[str, Any]] = []
 
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
 
-        # Optional file filter
-        if body.file and str(md.get("file", "")).strip() != str(body.file).strip():
+        if file_in and str(md.get("file","")).strip() != file_in:
             continue
 
-        # Date filter
-        if not in_range(str(md.get("date", ""))):
+        dstr = str(md.get("date","")).strip()
+        if not dstr or not in_range(dstr):
             continue
 
-        # Sum explicit fee columns safely (nulls, strings like "-3,000", "$12.34", etc.)
-        for c in fee_cols:
-            by_col[c] += _safe_float(md.get(c, 0.0), 0.0)
+        sym = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
+        # Borrow/overnight rows can be symbol-tied; if symbol filter is given, honor it.
+        if symbols and sym and sym not in symbols:
+            continue
 
-        # Borrow / overnight come from dedicated rows with fee_type + amount
-        ft  = str(md.get("fee_type") or "").strip().lower()
-        amt = _safe_float(md.get("amount", 0.0), 0.0)
-        if ft == "borrow_fee":
-            borrow_fees += amt
-        elif ft == "overnight_borrow_fee":
-            overnight_fees += amt
-
+        t = str(md.get("type") or md.get("Type") or "").strip().lower()
         rows_scanned += 1
 
-    by_column_sum = sum(by_col.values())
-    grand_total = by_column_sum + borrow_fees + overnight_fees
+        if t in ("borrow fee", "overnight fee"):
+            amt = _fee_amount_from_md(md)
+            if t == "borrow fee":
+                total_borrow += amt
+                if sym:
+                    borrow_by_symbol[sym] = borrow_by_symbol.get(sym, 0.0) + amt
+            else:
+                total_overnight += amt
+                if sym:
+                    overnight_by_symbol[sym] = overnight_by_symbol.get(sym, 0.0) + amt
+        else:
+            # Transaction-fee row: sum each column with signs as-is
+            colmap = _tx_by_column(md)
+            for k, v in colmap.items():
+                by_column_totals[k] += v
+            tx_sum = sum(colmap.values())
+            if sym:
+                transaction_by_symbol[sym] = transaction_by_symbol.get(sym, 0.0) + tx_sum
 
-    pretty_lines = []
-    pretty_lines.append(f"Rows scanned: {rows_scanned}")
-    pretty_lines.append("")
-    pretty_lines.append("--- Fee columns ---")
-    for c in fee_cols:
-        pretty_lines.append(f"{c:<10}: ${by_col[c]:,.2f}")
-    pretty_lines.append("")
-    pretty_lines.append(f"Borrow fees: ${borrow_fees:,.2f}")
-    pretty_lines.append(f"Overnight fees: ${overnight_fees:,.2f}")
-    pretty_lines.append("")
-    pretty_lines.append("=== ALL-IN FEES (fee columns + borrow + overnight) ===")
-    pretty_lines.append(f"${grand_total:,.2f}")
+        # Keep a very small sample for debugging (optional)
+        if len(filtered_rows) < 10:
+            filtered_rows.append({
+                "date": dstr,
+                "symbol": sym,
+                "type": t,
+                **{k: _to_f(md.get(k), 0.0) for k in FEE_COLUMNS},
+                "Amount": _to_f(md.get("Amount", md.get("amount")), 0.0)
+            })
+
+    by_column_sum = sum(by_column_totals.values())
+    grand_total_all_in = by_column_sum + total_borrow + total_overnight
+
+    # Per-symbol grand
+    by_symbol: Dict[str, Dict[str, float]] = {}
+    syms = set().union(transaction_by_symbol.keys(),
+                       borrow_by_symbol.keys(),
+                       overnight_by_symbol.keys())
+    for s in sorted(syms):
+        tx  = transaction_by_symbol.get(s, 0.0)
+        br  = borrow_by_symbol.get(s, 0.0)
+        on  = overnight_by_symbol.get(s, 0.0)
+        by_symbol[s] = {
+            "transaction_fees": round(tx, 2),
+            "borrow_fees": round(br, 2),
+            "overnight_fees": round(on, 2),
+            "symbol_total": round(tx + br + on, 2),
+        }
 
     return {
-        "ok": True,
         "filters": {
+            "file": file_in,
+            "start": start,
+            "end": end,
+            "top_k": top_k,
             "namespace": ns,
-            "query": body.query,
-            "top_k": body.top_k,
-            "start": body.start,
-            "end": body.end,
-            "symbols": body.symbols,
-            "file": body.file,
+            "symbols": symbols,
         },
         "rows_scanned": rows_scanned,
         "totals": {
-            "by_column": by_col,
+            "by_column": {k: round(v, 2) for k, v in by_column_totals.items()},
             "by_column_sum": round(by_column_sum, 2),
-            "borrow_fees": round(borrow_fees, 2),
-            "overnight_fees": round(overnight_fees, 2),
-            "grand_total_all_in": round(grand_total, 2),
+            "borrow_fees": round(total_borrow, 2),
+            "overnight_fees": round(total_overnight, 2),
+            "grand_total_all_in": round(grand_total_all_in, 2),
         },
-        "pretty": "\n".join(pretty_lines),
+        "by_symbol": by_symbol,
+        "sample_rows": filtered_rows,
     }
     
 # ==== /fees_summary (symbol-level daily & monthly) ====
