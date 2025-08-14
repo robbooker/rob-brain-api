@@ -237,90 +237,108 @@ def ask(body: AskBody, authorization: Optional[str] = Header(default=None)):
         "suggested_instruction": "Use the context excerpts to answer the user's question. Cite titles/sources from context. If something is unclear or missing, say so."
     }
 
-# ==== /fees ====
+# ==== /fees (UPDATED) ====
 
-from typing import Optional, Dict, Any, List
-import re
+from typing import Optional, List, Dict, Any
+from fastapi import Header
+from pydantic import BaseModel
 
-FEE_COLUMNS = ["TransFee","ECNTaker","ECNMaker","ORFFee","TAFFee","SECFee","CATFee","Commissions"]
+# If you already have FeesBody defined elsewhere, you can remove this class.
+class FeesBody(BaseModel):
+    file: Optional[str] = None
+    namespace: str = "trading"
+    query: str = "*"          # kept for compatibility; not strictly used here
+    top_k: int = 5000
+    start: Optional[str] = None  # YYYY-MM-DD or other parseable format handled by _parse_any_date
+    end:   Optional[str] = None
+    symbols: Optional[List[str]] = None  # Optional filter list of symbols (uppercased)
 
-def _to_f(x, default=0.0) -> float:
-    if x is None:
-        return float(default)
+def _fnum(v, default=0.0) -> float:
+    """Robust float parser for strings like '1,234.56', blanks, None, etc."""
     try:
-        if isinstance(x, str):
-            s = x.replace(",", "").replace("$", "").strip()
-            if s == "":
-                return float(default)
-            return float(s)
-        return float(x)
+        if v is None:
+            return float(default)
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).replace(",", "").strip()
+        if s == "":
+            return float(default)
+        return float(s)
     except Exception:
         return float(default)
 
-def _fee_amount_from_md(md: Dict[str, Any]) -> float:
-    """
-    For Borrow/Overnight rows, prefer 'Amount' (signed).
-    Fallback: parse 'Amount:' in text, then fallback to Price if present.
-    """
-    if "Amount" in md or "amount" in md:
-        amt = _to_f(md.get("Amount", md.get("amount")), 0.0)
-        if amt != 0.0:
-            return amt
-    txt = str(md.get("text") or "")
-    m = re.search(r"Amount:\s*([-+]?\$?\s*[0-9][0-9,]*(?:\.[0-9]+)?)", txt, flags=re.I)
-    if m:
-        return _to_f(m.group(1), 0.0)
-    return _to_f(md.get("price") or md.get("Price"), 0.0)
+def _str(v) -> str:
+    return "" if v is None else str(v).strip()
 
-def _tx_sum(md: Dict[str, Any]) -> float:
-    return sum(_to_f(md.get(k), 0.0) for k in FEE_COLUMNS)
-
-def _tx_by_column(md: Dict[str, Any]) -> Dict[str, float]:
-    return {k: _to_f(md.get(k), 0.0) for k in FEE_COLUMNS}
+def _is_between(date_str: str, start_dt, end_dt) -> bool:
+    if not (start_dt or end_dt):
+        return True
+    d = _parse_any_date(date_str)
+    if not d:
+        return False
+    if start_dt and d < start_dt:
+        return False
+    if end_dt and d > end_dt:
+        return False
+    return True
 
 @app.post("/fees")
-def fees(
+def fees_post(
     body: FeesBody,
     authorization: Optional[str] = Header(default=None),
 ):
     """
-    Fee accounting:
-      • Transaction fees (row type != Borrow/Overnight): sum fee columns with original signs.
-        Positive values (e.g., ECNMaker rebates) reduce total fees.
-      • Borrow/Overnight fees (row type == Borrow Fee / Overnight Fee): use 'Amount' (signed).
-      • Returns per-column totals, per-symbol totals, and grand totals.
+    Fee rollup (date-window inclusive):
+      - Borrow/Overnight fee rows are recognized via Type ('Borrow Fee' or 'Overnight Fee')
+        and use the **Amount** column (signed).
+      - Per-trade transaction fee columns are summed as-is (signed):
+          TransFee, ECNTaker, ECNMaker, ORFFee, TAFFee, SECFee, CATFee, Commissions
+      - Optional filters: file, symbols[], start, end
+    Response:
+      {
+        filters: {...},
+        rows_scanned: int,
+        totals: {
+          by_column: {...},               # sum of each transaction-fee column
+          by_column_sum: float,           # sum of the 8 transaction-fee columns
+          borrow_fees: float,             # sum of Borrow Fee amounts
+          overnight_fees: float,          # sum of Overnight Fee amounts
+          grand_total_all_in: float       # by_column_sum + borrow_fees + overnight_fees
+        },
+        by_symbol: {
+          "SYMBOL": {
+            transaction_fees: float,
+            borrow_fees: float,
+            overnight_fees: float,
+            symbol_total: float
+          }, ...
+        },
+        sample_rows: [ up to 25 filtered rows with light fields ]
+      }
     """
     _check_bearer(authorization)
 
-    ns       = body.namespace or "trading"
-    top_k    = body.top_k or 5000
-    file_in  = (body.file or "").strip() or None
-    start    = body.start
-    end      = body.end
-    symbols  = body.symbols or None
+    ns = body.namespace or "trading"
+    start_dt = _parse_any_date(body.start) if body.start else None
+    end_dt   = _parse_any_date(body.end)   if body.end   else None
+    sym_filter = set([s.strip().upper() for s in (body.symbols or [])]) if body.symbols else None
+    file_in = _str(body.file)
 
-    start_dt = _parse_any_date(start) if start else None
-    end_dt   = _parse_any_date(end)   if end else None
-
-    def in_range(dstr: str) -> bool:
-        if not (start_dt or end_dt):
-            return True
-        d = _parse_any_date(dstr)
-        if not d:
-            return False
-        if start_dt and d < start_dt: return False
-        if end_dt   and d > end_dt:   return False
-        return True
-
-    # Vector fetch
-    qvec = embed_query("fees commissions borrow overnight transaction fee rows amount columns")
-    res  = index.query(vector=qvec, top_k=top_k, namespace=ns, include_metadata=True)
+    # Query a broad slice of rows likely to contain fee/trade information
+    probe = "short trades transaction fees ECN maker taker ORF TAF SEC CAT commissions borrow fee overnight fee"
+    vec = embed_query(probe)
+    res = index.query(
+        vector=vec,
+        top_k=body.top_k,
+        namespace=ns,
+        include_metadata=True
+    )
     matches = getattr(res, "matches", []) or []
 
-    rows_scanned = 0
+    # Accumulators
+    fee_columns = ["TransFee", "ECNTaker", "ECNMaker", "ORFFee", "TAFFee", "SECFee", "CATFee", "Commissions"]
 
-    # Aggregates
-    by_column_totals: Dict[str, float] = {k: 0.0 for k in FEE_COLUMNS}
+    by_column_totals: Dict[str, float] = {k: 0.0 for k in fee_columns}
     transaction_by_symbol: Dict[str, float] = {}
     borrow_by_symbol: Dict[str, float] = {}
     overnight_by_symbol: Dict[str, float] = {}
@@ -328,64 +346,82 @@ def fees(
     total_borrow = 0.0
     total_overnight = 0.0
 
+    rows_scanned = 0
     filtered_rows: List[Dict[str, Any]] = []
 
     for m in matches:
         md = getattr(m, "metadata", {}) or {}
 
-        if file_in and str(md.get("file","")).strip() != file_in:
+        # File filter (optional)
+        if file_in and _str(md.get("file")) != file_in:
             continue
 
-        dstr = str(md.get("date","")).strip()
-        if not dstr or not in_range(dstr):
+        date_str = _str(md.get("date"))
+        if not _is_between(date_str, start_dt, end_dt):
             continue
 
-        sym = str(md.get("symbol") or md.get("Symbol") or "").strip().upper()
-        # Borrow/overnight rows can be symbol-tied; if symbol filter is given, honor it.
-        if symbols and sym and sym not in symbols:
+        symbol = _str(md.get("symbol") or md.get("Symbol")).upper()
+        if sym_filter and (not symbol or symbol not in sym_filter):
             continue
 
-        t = str(md.get("type") or md.get("Type") or "").strip().lower()
+        typ = _str(md.get("type") or md.get("Type")).lower()
+
+        # Collect per-row data for sample
+        row_info = {
+            "date": date_str,
+            "symbol": symbol,
+            "type": _str(md.get("type") or md.get("Type")),
+            "file": _str(md.get("file")),
+        }
+
+        # Branch 1: Borrow/Overnight fee rows — use Amount column
+        if typ in ("borrow fee", "overnight fee"):
+            amount = _fnum(md.get("Amount") or md.get("amount"), 0.0)
+            if typ == "borrow fee":
+                total_borrow += amount
+                if symbol:
+                    borrow_by_symbol[symbol] = borrow_by_symbol.get(symbol, 0.0) + amount
+            else:
+                total_overnight += amount
+                if symbol:
+                    overnight_by_symbol[symbol] = overnight_by_symbol.get(symbol, 0.0) + amount
+
+            row_info["amount"] = amount
+            filtered_rows.append(row_info)
+            rows_scanned += 1
+            continue
+
+        # Branch 2: Regular trade rows — sum transaction fee columns (signed)
+        # Pull and sum the 8 columns
+        row_tx_sum = 0.0
+        for col in fee_columns:
+            val = _fnum(md.get(col), 0.0)
+            by_column_totals[col] += val
+            row_tx_sum += val
+
+        if abs(row_tx_sum) > 0:
+            # Track per-symbol transaction fees
+            if symbol:
+                transaction_by_symbol[symbol] = transaction_by_symbol.get(symbol, 0.0) + row_tx_sum
+
+            row_info.update({
+                "bs": _str(md.get("bs") or md.get("B/S")),
+                "tx_fees_sum": row_tx_sum,
+            })
+            filtered_rows.append(row_info)
+
         rows_scanned += 1
 
-        if t in ("borrow fee", "overnight fee"):
-            amt = _fee_amount_from_md(md)
-            if t == "borrow fee":
-                total_borrow += amt
-                if sym:
-                    borrow_by_symbol[sym] = borrow_by_symbol.get(sym, 0.0) + amt
-            else:
-                total_overnight += amt
-                if sym:
-                    overnight_by_symbol[sym] = overnight_by_symbol.get(sym, 0.0) + amt
-        else:
-            # Transaction-fee row: sum each column with signs as-is
-            colmap = _tx_by_column(md)
-            for k, v in colmap.items():
-                by_column_totals[k] += v
-            tx_sum = sum(colmap.values())
-            if sym:
-                transaction_by_symbol[sym] = transaction_by_symbol.get(sym, 0.0) + tx_sum
-
-        # Keep a very small sample for debugging (optional)
-        if len(filtered_rows) < 10:
-            filtered_rows.append({
-                "date": dstr,
-                "symbol": sym,
-                "type": t,
-                **{k: _to_f(md.get(k), 0.0) for k in FEE_COLUMNS},
-                "Amount": _to_f(md.get("Amount", md.get("amount")), 0.0)
-            })
-
+    # Compose totals
     by_column_sum = sum(by_column_totals.values())
     grand_total_all_in = by_column_sum + total_borrow + total_overnight
 
-    # Per-symbol grand
+    # Per-symbol combined view
     by_symbol: Dict[str, Dict[str, float]] = {}
-    syms = set().union(transaction_by_symbol.keys(),
-                       borrow_by_symbol.keys(),
-                       overnight_by_symbol.keys())
-    for s in sorted(syms):
+    all_symbols = set().union(transaction_by_symbol.keys(),
+                              borrow_by_symbol.keys(),
+                              overnight_by_symbol.keys())
+    for s in sorted(all_symbols):
         tx  = transaction_by_symbol.get(s, 0.0)
         br  = borrow_by_symbol.get(s, 0.0)
         on  = overnight_by_symbol.get(s, 0.0)
@@ -396,14 +432,17 @@ def fees(
             "symbol_total": round(tx + br + on, 2),
         }
 
+    # Keep sample modest
+    sample_rows = filtered_rows[:25]
+
     return {
         "filters": {
             "file": file_in,
-            "start": start,
-            "end": end,
-            "top_k": top_k,
+            "start": body.start,
+            "end": body.end,
+            "top_k": body.top_k,
             "namespace": ns,
-            "symbols": symbols,
+            "symbols": sorted(list(sym_filter)) if sym_filter else None,
         },
         "rows_scanned": rows_scanned,
         "totals": {
@@ -414,7 +453,7 @@ def fees(
             "grand_total_all_in": round(grand_total_all_in, 2),
         },
         "by_symbol": by_symbol,
-        "sample_rows": filtered_rows,
+        "sample_rows": sample_rows,
     }
     
 # ==== /fees_summary (symbol-level daily & monthly) ====
