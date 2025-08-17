@@ -237,33 +237,47 @@ if st.button("Run Search"):
     except Exception as e:
         st.error(f"Search error: {e}")
 
+# -------------------- Q&A over the vector index --------------------
 st.markdown("---")
 st.subheader("🗣️ Ask the Library (with citations)")
 
-qa_query = st.text_input("Your question", value="What does Marcus Aurelius say about forgiveness?")
-qa_topk  = st.number_input("Top K (chunks to retrieve)", min_value=4, max_value=50, value=12, step=1)
+qa_query    = st.text_input("Your question", value="What does Marcus Aurelius say about forgiveness?")
+qa_topk     = st.number_input("Top K (chunks to use)", min_value=4, max_value=50, value=12, step=1, key="qa_topk")
+qa_minscore = st.slider("Minimum vector score (optional)", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
 
 if st.button("Answer with citations"):
     try:
+        # Build the body expected by POST /answer
         body = {
-            "question": qa_query,          # <-- use 'question' (not 'query')
-            "namespace": namespace,
-            "top_k": int(qa_topk)
+            "query": qa_query,
+            "namespace": namespace,   # comes from the sidebar input you already have
+            "top_k": int(qa_topk),
+            "min_score": float(qa_minscore) if qa_minscore > 0 else None
         }
+
         data = post_json(f"{base_url}/answer", auth_headers(token), body)
         st.success("Answer generated.")
 
+        # Render the answer
+        st.markdown("### Answer")
         st.markdown(data.get("answer", "_no answer_"))
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.caption("Citations")
-            st.table(data.get("citations", []))
-        with c2:
-            st.caption("Supporting snippets")
-            st.dataframe(data.get("snippets", []), use_container_width=True)
+        # Citations (small table)
+        cits = data.get("citations", [])
+        if cits:
+            st.markdown("#### Citations")
+            # expecting items like {"n": 1, "hash": "...", "source": "..."}
+            st.table(cits)
+
+        # Supporting snippets (full text)
+        snips = data.get("snippets", [])
+        if snips:
+            st.markdown("#### Supporting snippets")
+            # typically: {"hash","source","namespace","text"}
+            st.dataframe(snips, use_container_width=True)
 
         with st.expander("Raw JSON"):
             st.code(json.dumps(data, indent=2))
+
     except Exception as e:
         st.error(f"Answer error: {e}")
