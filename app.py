@@ -1242,26 +1242,10 @@ def shorts_over_price(
         "rows": out
     }
 
-# --- add to app.py ---
+# ==== /answer (RAG answer with citations; debug fallback) ====
+
 from pydantic import BaseModel
-from fastapi import APIRouter, Header, HTTPException
-from typing import Optional, Dict, Any, List
-from openai import OpenAI
-import os, requests
-
-router = APIRouter()
-
-class AnswerBody(BaseModel):
-    query: str
-    namespace: str = "nonfiction"   # change if you want a different default
-    top_k: int = 12
-    min_score: Optional[float] = None
-
-# --- DEBUG ANSWER (no OpenAI call) ---
 from fastapi import HTTPException
-import logging
-
-logger = logging.getLogger("uvicorn.error")
 
 class AnswerBody(BaseModel):
     query: str
@@ -1269,30 +1253,122 @@ class AnswerBody(BaseModel):
     top_k: int = 12
     min_score: Optional[float] = None
 
-@app.post("/answer", summary="Answer")
-def answer_debug(body: AnswerBody, authorization: Optional[str] = Header(None)):
+def _vector_search_simple(query: str, namespace: str, top_k: int, min_score: Optional[float]) -> List[Dict[str, Any]]:
     """
-    TEMP: returns vector search hits as 'snippets' and basic 'citations'.
-    No OpenAI call. Helps pinpoint 500 source.
+    Runs an embedding search against a single namespace and returns
+    a list of hits with normalized fields: score, metadata, id.
     """
+    vec = embed_query(query)
     try:
-        # reuse your existing search helper if you have one; otherwise hit your /search internally
-        res = search_index(
-            query=body.query,
-            namespace=body.namespace,
-            top_k=body.top_k,
-            min_score=body.min_score,
-        )
-        hits = res.get("hits", [])
-        snippets = []
-        citations = []
-        for h in hits:
-            md = h.get("metadata", {})
-            snippets.append({
-                "text": md.get("text", ""),
-                "source": md.get("source", ""),
-                "title": md.get("title", ""),
-           
+        res = index.query(vector=vec, top_k=top_k, namespace=namespace, include_metadata=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Vector query failed: {e}")
 
-# ensure this line exists once in app.py
-app.include_router(router)
+    matches = getattr(res, "matches", []) or []
+    hits = []
+    for m in matches:
+        sc = getattr(m, "score", 0.0) or 0.0
+        if (min_score is not None) and sc < float(min_score):
+            continue
+        hits.append({
+            "score": sc,
+            "id": getattr(m, "id", None),
+            "metadata": getattr(m, "metadata", {}) or {},
+        })
+    return hits
+
+@app.post("/answer", summary="Answer")
+def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)):
+    """
+    Synthesizes a short answer from vector search results in the requested namespace.
+    - If OPENAI_API_KEY is missing, returns a debug payload with snippets & citations (no model call).
+    - Citations appear as [1], [2], ... based on snippet order.
+    """
+    _check_bearer(authorization)
+
+    # 1) Vector search
+    hits = _vector_search_simple(
+        query=body.query,
+        namespace=body.namespace,
+        top_k=body.top_k,
+        min_score=body.min_score
+    )
+
+    # 2) Build snippets and numbered context
+    snippets: List[Dict[str, Any]] = []
+    for h in hits:
+        md = h.get("metadata", {}) or {}
+        snippets.append({
+            "hash": md.get("uid") or md.get("hash") or h.get("id"),
+            "source": md.get("source") or md.get("file") or md.get("symbol") or md.get("title") or "",
+            "namespace": md.get("namespace") or body.namespace,
+            "title": md.get("title") or md.get("symbol") or md.get("file") or "",
+            "text": md.get("text") or md.get("description") or md.get("content") or "",
+            "score": h.get("score", 0.0) or 0.0,
+        })
+
+    # If no snippets, return a helpful empty response
+    if not snippets:
+        return {
+            "answer": "I couldn’t find anything relevant in the vector index for that question.",
+            "citations": [],
+            "snippets": [],
+            "used_top_k": 0,
+            "namespace": body.namespace
+        }
+
+    blocks = []
+    for i, s in enumerate(snippets, start=1):
+        txt = (s["text"] or "").strip()
+        if not txt:
+            continue
+        blocks.append(f"[{i}] {txt}\n(source={s['source']}, hash={s['hash']})")
+    context = "\n\n".join(blocks)
+
+    # 3) If no OpenAI key, return debug (no model call)
+    if not os.getenv("OPENAI_API_KEY"):
+        return {
+            "answer": "(debug) No OPENAI_API_KEY set on the backend — returning snippets only.",
+            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"]} for i, s in enumerate(snippets)],
+            "snippets": snippets,
+            "used_top_k": len(snippets),
+            "namespace": body.namespace
+        }
+
+    # 4) Call OpenAI to synthesize an answer with inline citations
+    try:
+        model = os.getenv("ANSWER_MODEL", "gpt-4o-mini")
+        prompt = f"""Answer the question using ONLY the context. If something is not in the context, say you can't find it.
+Cite sources inline using square-bracket numbers like [1], [2] that refer to the context blocks below.
+
+Question: {body.query}
+
+Context:
+{context}
+"""
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": "Be concise, factual, and cite sources with [1], [2], etc."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        answer_text = resp.choices[0].message.content
+    except Exception as e:
+        # Graceful fallback if the model call fails
+        return {
+            "answer": f"(debug) Model call failed: {e}. Returning snippets only.",
+            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"]} for i, s in enumerate(snippets)],
+            "snippets": snippets,
+            "used_top_k": len(snippets),
+            "namespace": body.namespace
+        }
+
+    return {
+        "answer": answer_text,
+        "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"]} for i, s in enumerate(snippets)],
+        "snippets": snippets,
+        "used_top_k": len(snippets),
+        "namespace": body.namespace
+    }
