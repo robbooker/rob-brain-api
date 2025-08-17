@@ -1241,3 +1241,77 @@ def shorts_over_price(
         "count": len(out),
         "rows": out
     }
+
+# --- add to app.py ---
+from pydantic import BaseModel
+from fastapi import APIRouter, Header, HTTPException
+from typing import Optional, Dict, Any, List
+from openai import OpenAI
+import os, requests
+
+router = APIRouter()
+
+class AnswerBody(BaseModel):
+    query: str
+    namespace: str = "nonfiction"   # change if you want a different default
+    top_k: int = 12
+    min_score: Optional[float] = None
+
+@router.post("/answer")
+def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)):
+    # 1) call existing /search to get top chunks
+    base_url = os.getenv("APP_BASE_URL", "http://localhost:8000")
+    headers = {"Authorization": authorization} if authorization else {}
+    payload = {"query": body.query, "top_k": body.top_k, "namespace": body.namespace}
+    r = requests.post(f"{base_url}/search", json=payload, headers=headers, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    hits = r.json().get("hits", [])
+
+    if body.min_score is not None:
+        hits = [h for h in hits if (h.get("score") or 0) >= body.min_score]
+
+    # 2) build snippets + numbered context for citations
+    snippets: List[Dict[str, Any]] = []
+    for h in hits:
+        md = h.get("metadata", {}) or {}
+        snippets.append({
+            "hash": md.get("uid") or md.get("hash") or h.get("id"),
+            "source": md.get("source") or md.get("file") or md.get("symbol") or "",
+            "namespace": md.get("namespace") or body.namespace,
+            "text": md.get("text") or md.get("description") or "",
+        })
+    blocks = []
+    for i, s in enumerate(snippets, start=1):
+        blocks.append(f"[{i}] {s['text']}\n(source={s['source']}, hash={s['hash']})")
+    context = "\n\n".join(blocks)
+
+    # 3) ask the model to synthesize (with citations)
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model = os.getenv("ANSWER_MODEL", "gpt-4o-mini")
+    prompt = f"""Answer using ONLY the context. Cite sources like [1], [2]. 
+If it’s not in context, say so.
+
+Question: {body.query}
+
+Context:
+{context}
+"""
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": "Be concise, factual, and cite sources like [1], [2]."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    answer = resp.choices[0].message.content
+    return {
+        "answer": answer,
+        "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"]} for i, s in enumerate(snippets)],
+        "snippets": snippets,
+        "used_top_k": len(snippets),
+    }
+
+# ensure this line exists once in app.py
+app.include_router(router)
