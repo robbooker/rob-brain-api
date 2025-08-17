@@ -45,10 +45,13 @@ with st.sidebar:
 
     st.caption("Tip: set env vars APP_BASE_URL / ROB_BRAIN_TOKEN / ROB_BRAIN_FILE to prefill these.")
 
-    # New fields
-    namespace = st.text_input("Namespace", value="trading", help="e.g., trading, nonfiction, short-selling")
-    top_k_search = st.number_input("Top K (search)", min_value=1, max_value=5000, value=8, step=1)
-
+    # New fields Dropdown
+    namespace = st.selectbox(
+    "Namespace",
+    options=["all", "nonfiction", "trading", "short-selling"],
+    index=0,
+    help="Search one or all namespaces"
+)
 # Health check
 col_h1, col_h2 = st.columns([1,3])
 with col_h1:
