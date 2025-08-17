@@ -45,6 +45,10 @@ with st.sidebar:
 
     st.caption("Tip: set env vars APP_BASE_URL / ROB_BRAIN_TOKEN / ROB_BRAIN_FILE to prefill these.")
 
+    # New fields
+    namespace = st.text_input("Namespace", value="trading", help="e.g., trading, nonfiction, short-selling")
+    top_k_search = st.number_input("Top K (search)", min_value=1, max_value=5000, value=8, step=1)
+
 # Health check
 col_h1, col_h2 = st.columns([1,3])
 with col_h1:
@@ -203,3 +207,32 @@ if st.button("Run Fees"):
             st.code(json.dumps(data, indent=2))
     except Exception as e:
         st.error(f"Fees error: {e}")
+
+section_divider()
+st.subheader("🔎 Vector Search (any namespace)")
+
+qcol1, qcol2 = st.columns([3,1])
+with qcol1:
+    query_text = st.text_input("Query", value="*")
+with qcol2:
+    st.caption("Use * to list rows")
+
+if st.button("Run Search"):
+    try:
+        body = {
+            "query": query_text,
+            "top_k": int(top_k_search),
+            "namespace": namespace
+        }
+        data = post_json(f"{base_url}/search", auth_headers(token), body)
+        st.success("Search complete.")
+        hits = data.get("hits", [])
+        st.write(f"Results: {len(hits)}")
+        # Show the metadata for inspection
+        rows = [h.get("metadata", {}) for h in hits]
+        if rows:
+            st.dataframe(rows, use_container_width=True)
+        with st.expander("Raw JSON"):
+            st.code(json.dumps(data, indent=2))
+    except Exception as e:
+        st.error(f"Search error: {e}")
