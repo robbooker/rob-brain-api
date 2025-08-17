@@ -1,4 +1,4 @@
-# cli.py
+cat > cli.py <<'PY'
 import os, json, requests, typer
 
 APP   = os.environ.get("APP", "https://rob-brain-api-1.onrender.com")
@@ -46,3 +46,4 @@ def fees(start: str, end: str, file: str, top_k: int = 8000):
 
 if __name__ == "__main__":
     app()
+PY
