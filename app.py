@@ -108,6 +108,14 @@ def _md_get(md: Dict[str, Any], *keys, default=None):
             return md[k]
     return default
 
+def _namespaces_to_query(ns_in: Optional[str]) -> list[str]:
+    if ns_in is None:
+        return ["nonfiction", "trading", "short-selling"]
+    ns = (ns_in or "").strip().lower()
+    if ns in ("", "all", "*"):
+        return ["nonfiction", "trading", "short-selling"]
+    return [ns_in]
+
 # ==== Models (pydantic lite via typing) ====
 from pydantic import BaseModel
 class SearchBody(BaseModel):
