@@ -1314,34 +1314,43 @@ def _vector_search_multi(query: str, namespaces: List[str], top_k: int, min_scor
 @app.post("/answer", summary="Answer")
 def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)):
     """
-    Synthesizes a short answer from vector search results in the requested namespace.
-    - If OPENAI_API_KEY is missing, returns a debug payload with snippets & citations (no model call).
-    - Citations appear as [1], [2], ... based on snippet order.
+    Synthesizes a short answer from vector search results.
+    - If body.namespace == 'all', we search across ['nonfiction','trading','short-selling'].
+    - If OPENAI_API_KEY is missing or model call fails, return a debug payload with snippets & citations.
     """
     _check_bearer(authorization)
 
-    # 1) Vector search
-    hits = _vector_search_simple(
-        query=body.query,
-        namespace=body.namespace,
-        top_k=body.top_k,
-        min_score=body.min_score
-    )
+    # 1) Vector search (single or multi-namespace)
+    if body.namespace.strip().lower() in ("all", "", "any", "everything"):
+        namespaces = ["nonfiction", "trading", "short-selling"]
+        hits = _vector_search_multi(
+            query=body.query,
+            namespaces=namespaces,
+            top_k=body.top_k,
+            min_score=body.min_score
+        )
+    else:
+        hits = _vector_search_simple(
+            query=body.query,
+            namespace=body.namespace,
+            top_k=body.top_k,
+            min_score=body.min_score
+        )
 
     # 2) Build snippets and numbered context
     snippets: List[Dict[str, Any]] = []
     for h in hits:
         md = h.get("metadata", {}) or {}
+        ns = h.get("namespace") or md.get("namespace") or body.namespace
         snippets.append({
             "hash": md.get("uid") or md.get("hash") or h.get("id"),
             "source": md.get("source") or md.get("file") or md.get("symbol") or md.get("title") or "",
-            "namespace": md.get("namespace") or body.namespace,
+            "namespace": ns,
             "title": md.get("title") or md.get("symbol") or md.get("file") or "",
             "text": md.get("text") or md.get("description") or md.get("content") or "",
-            "score": h.get("score", 0.0) or 0.0,
+            "score": float(h.get("score", 0.0) or 0.0),
         })
 
-    # If no snippets, return a helpful empty response
     if not snippets:
         return {
             "answer": "I couldn’t find anything relevant in the vector index for that question.",
@@ -1356,14 +1365,15 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
         txt = (s["text"] or "").strip()
         if not txt:
             continue
-        blocks.append(f"[{i}] {txt}\n(source={s['source']}, hash={s['hash']})")
+        # include namespace for clarity in merged results
+        blocks.append(f"[{i}] {txt}\n(source={s['source']}, ns={s['namespace']}, hash={s['hash']})")
     context = "\n\n".join(blocks)
 
     # 3) If no OpenAI key, return debug (no model call)
     if not os.getenv("OPENAI_API_KEY"):
         return {
             "answer": "(debug) No OPENAI_API_KEY set on the backend — returning snippets only.",
-            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"]} for i, s in enumerate(snippets)],
+            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
             "snippets": snippets,
             "used_top_k": len(snippets),
             "namespace": body.namespace
@@ -1390,10 +1400,9 @@ Context:
         )
         answer_text = resp.choices[0].message.content
     except Exception as e:
-        # Graceful fallback if the model call fails
         return {
             "answer": f"(debug) Model call failed: {e}. Returning snippets only.",
-            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"]} for i, s in enumerate(snippets)],
+            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
             "snippets": snippets,
             "used_top_k": len(snippets),
             "namespace": body.namespace
@@ -1401,7 +1410,7 @@ Context:
 
     return {
         "answer": answer_text,
-        "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"]} for i, s in enumerate(snippets)],
+        "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
         "snippets": snippets,
         "used_top_k": len(snippets),
         "namespace": body.namespace
