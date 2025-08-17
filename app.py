@@ -1285,6 +1285,32 @@ def _vector_search_simple(query: str, namespace: str, top_k: int, min_score: Opt
         })
     return hits
 
+def _vector_search_multi(query: str, namespaces: List[str], top_k: int, min_score: Optional[float]) -> List[Dict[str, Any]]:
+    """
+    Run vector search across multiple namespaces and merge results.
+    Returns a list of hits with: namespace, score, id, metadata.
+    """
+    vec = embed_query(query)
+    merged: List[Dict[str, Any]] = []
+    for ns in namespaces:
+        try:
+            res = index.query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
+            matches = getattr(res, "matches", []) or []
+            for m in matches:
+                sc = float(getattr(m, "score", 0.0) or 0.0)
+                if (min_score is not None) and sc < float(min_score):
+                    continue
+                merged.append({
+                    "namespace": ns,
+                    "score": sc,
+                    "id": getattr(m, "id", None),
+                    "metadata": getattr(m, "metadata", {}) or {},
+                })
+        except Exception as e:
+            # non-fatal; record the error as a zero-score stub
+            merged.append({"namespace": ns, "score": 0.0, "id": None, "metadata": {"error": str(e)}})
+    return merged
+
 @app.post("/answer", summary="Answer")
 def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)):
     """
