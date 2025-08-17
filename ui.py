@@ -241,17 +241,29 @@ st.markdown("---")
 st.subheader("🗣️ Ask the Library (with citations)")
 
 qa_query = st.text_input("Your question", value="What does Marcus Aurelius say about forgiveness?")
-qa_topk  = st.number_input("Top K", min_value=4, max_value=50, value=12, step=1)
+qa_topk  = st.number_input("Top K (chunks to retrieve)", min_value=4, max_value=50, value=12, step=1)
 
 if st.button("Answer with citations"):
     try:
-        body = {"query": qa_query, "namespace": namespace, "top_k": int(qa_topk)}
+        body = {
+            "question": qa_query,          # <-- use 'question' (not 'query')
+            "namespace": namespace,
+            "top_k": int(qa_topk)
+        }
         data = post_json(f"{base_url}/answer", auth_headers(token), body)
         st.success("Answer generated.")
+
         st.markdown(data.get("answer", "_no answer_"))
-        with st.expander("Citations"):
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Citations")
             st.table(data.get("citations", []))
-        with st.expander("Supporting snippets"):
+        with c2:
+            st.caption("Supporting snippets")
             st.dataframe(data.get("snippets", []), use_container_width=True)
+
+        with st.expander("Raw JSON"):
+            st.code(json.dumps(data, indent=2))
     except Exception as e:
         st.error(f"Answer error: {e}")
