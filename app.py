@@ -1320,8 +1320,8 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
     """
     _check_bearer(authorization)
 
-    # 1) Vector search (single or multi-namespace)
-    if body.namespace.strip().lower() in ("all", "", "any", "everything"):
+     # 1) Vector search (single ns or multi-ns)
+    if body.namespace and body.namespace.lower() in ("all", "*", ""):
         namespaces = ["nonfiction", "trading", "short-selling"]
         hits = _vector_search_multi(
             query=body.query,
