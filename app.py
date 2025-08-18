@@ -1250,14 +1250,14 @@ def shorts_over_price(
         "rows": out
     }
 
-# ==== /answer (RAG answer with citations; debug fallback) ====
+# ==== /answer (RAG answer with citations; multi-namespace support) ====
 
 from pydantic import BaseModel
-from fastapi import HTTPException
+from fastapi import HTTPException, Header
 
 class AnswerBody(BaseModel):
     query: str
-    namespace: str = "nonfiction"
+    namespace: str = "nonfiction"   # "all" will fan out to multiple namespaces
     top_k: int = 12
     min_score: Optional[float] = None
 
@@ -1282,6 +1282,7 @@ def _vector_search_simple(query: str, namespace: str, top_k: int, min_score: Opt
             "score": sc,
             "id": getattr(m, "id", None),
             "metadata": getattr(m, "metadata", {}) or {},
+            "namespace": namespace,
         })
     return hits
 
@@ -1307,21 +1308,23 @@ def _vector_search_multi(query: str, namespaces: List[str], top_k: int, min_scor
                     "metadata": getattr(m, "metadata", {}) or {},
                 })
         except Exception as e:
-            # non-fatal; record the error as a zero-score stub
+            # non-fatal; record the error as a stub so we can see which ns failed
             merged.append({"namespace": ns, "score": 0.0, "id": None, "metadata": {"error": str(e)}})
     return merged
 
 @app.post("/answer", summary="Answer")
 def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)):
     """
-    Synthesizes a short answer from vector search results.
-    - If body.namespace == 'all', we search across ['nonfiction','trading','short-selling'].
-    - If OPENAI_API_KEY is missing or model call fails, return a debug payload with snippets & citations.
+    Synthesizes a short answer from vector search results in the requested namespace.
+    - If namespace == 'all' (or '*' or ''), fans out across ['nonfiction','trading','short-selling'].
+    - If OPENAI_API_KEY is missing or model call fails, returns a debug payload with snippets & citations.
+    - Citations appear as [1], [2], ... based on snippet order.
     """
     _check_bearer(authorization)
 
-     # 1) Vector search (single ns or multi-ns)
-    if body.namespace and body.namespace.lower() in ("all", "*", ""):
+    # 1) Vector search (single ns or multi-ns)
+    ns_raw = (body.namespace or "").lower()
+    if ns_raw in ("all", "*", ""):
         namespaces = ["nonfiction", "trading", "short-selling"]
         hits = _vector_search_multi(
             query=body.query,
@@ -1329,6 +1332,7 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
             top_k=body.top_k,
             min_score=body.min_score
         )
+        effective_namespace = "all"
     else:
         hits = _vector_search_simple(
             query=body.query,
@@ -1336,12 +1340,13 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
             top_k=body.top_k,
             min_score=body.min_score
         )
+        effective_namespace = body.namespace
 
     # 2) Build snippets and numbered context
     snippets: List[Dict[str, Any]] = []
     for h in hits:
         md = h.get("metadata", {}) or {}
-        ns = h.get("namespace") or md.get("namespace") or body.namespace
+        ns = h.get("namespace") or md.get("namespace") or effective_namespace
         snippets.append({
             "hash": md.get("uid") or md.get("hash") or h.get("id"),
             "source": md.get("source") or md.get("file") or md.get("symbol") or md.get("title") or "",
@@ -1357,7 +1362,7 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
             "citations": [],
             "snippets": [],
             "used_top_k": 0,
-            "namespace": body.namespace
+            "namespace": effective_namespace
         }
 
     blocks = []
@@ -1376,7 +1381,7 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
             "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
             "snippets": snippets,
             "used_top_k": len(snippets),
-            "namespace": body.namespace
+            "namespace": effective_namespace
         }
 
     # 4) Call OpenAI to synthesize an answer with inline citations
@@ -1400,12 +1405,13 @@ Context:
         )
         answer_text = resp.choices[0].message.content
     except Exception as e:
+        # Graceful fallback if the model call fails
         return {
             "answer": f"(debug) Model call failed: {e}. Returning snippets only.",
             "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
             "snippets": snippets,
             "used_top_k": len(snippets),
-            "namespace": body.namespace
+            "namespace": effective_namespace
         }
 
     return {
@@ -1413,5 +1419,5 @@ Context:
         "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
         "snippets": snippets,
         "used_top_k": len(snippets),
-        "namespace": body.namespace
+        "namespace": effective_namespace
     }
