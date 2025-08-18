@@ -34,25 +34,73 @@ def section_divider():
 
 # --- UI ---
 st.set_page_config(page_title="Rob Brain – Trading Analytics", layout="wide")
-
 st.title("🧠 Rob Brain – Trading Analytics")
 
+# ====================== SIDEBAR ======================
 with st.sidebar:
     st.header("Settings")
     base_url = st.text_input("API Base URL", value=DEFAULT_BASE_URL, help="Your Render service URL")
     token    = st.text_input("Auth Token", value=DEFAULT_TOKEN, type="password", help="ROB_BRAIN_TOKEN")
     file_in  = st.text_input("CSV Filename", value=DEFAULT_FILE, help="Exact filename stored in the vector index")
-
     st.caption("Tip: set env vars APP_BASE_URL / ROB_BRAIN_TOKEN / ROB_BRAIN_FILE to prefill these.")
 
-    # New fields Dropdown
     namespace = st.selectbox(
-    "Namespace",
-    options=["all", "nonfiction", "trading", "short-selling"],
-    index=0,
-    help="Search one or all namespaces"
-)
-# Health check
+        "Namespace",
+        options=["all", "nonfiction", "trading", "short-selling"],
+        index=0,
+        help="Search one or all namespaces"
+    )
+    # used by the plain vector search section
+    top_k_search = st.number_input("Top K (search)", min_value=1, max_value=5000, value=8, step=1)
+
+# ====================== TOP: Q&A (NATURAL LANGUAGE) ======================
+st.subheader("🗣️ Ask the Library (natural language)")
+
+qa_cols = st.columns([3, 1, 1])
+with qa_cols[0]:
+    qa_query = st.text_input("Your question", value="What does Marcus Aurelius say about forgiveness?")
+with qa_cols[1]:
+    qa_topk  = st.number_input("Top K (chunks)", min_value=4, max_value=50, value=12, step=1, key="qa_topk")
+with qa_cols[2]:
+    qa_minscore = st.number_input("Min vector score (0–1)", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+
+if st.button("Answer with citations"):
+    try:
+        body = {
+            "query": qa_query,
+            "namespace": namespace,   # from sidebar; can be 'all'
+            "top_k": int(qa_topk),
+            "min_score": float(qa_minscore),
+        }
+        data = post_json(f"{base_url}/answer", auth_headers(token), body)
+        st.success("Answer generated.")
+
+        st.markdown("### Answer")
+        st.markdown(data.get("answer", "_no answer_"))
+
+        with st.expander("📎 Citations (click to expand)"):
+            cits = data.get("citations", [])
+            if cits:
+                st.table(cits)
+            else:
+                st.caption("No citations returned.")
+
+        with st.expander("🧩 Supporting snippets (click to expand)"):
+            snips = data.get("snippets", [])
+            if snips:
+                st.dataframe(snips, use_container_width=True)
+            else:
+                st.caption("No snippets returned.")
+
+        with st.expander("🔧 Raw JSON (debug)"):
+            st.code(json.dumps(data, indent=2))
+
+    except Exception as e:
+        st.error(f"Answer error: {e}")
+
+section_divider()
+
+# ====================== HEALTH / OPENAPI ======================
 col_h1, col_h2 = st.columns([1,3])
 with col_h1:
     if st.button("✅ Health check"):
@@ -73,7 +121,7 @@ with col_h2:
 
 section_divider()
 
-# Short P&L Breakdown
+# ====================== SHORT P&L BREAKDOWN ======================
 st.subheader("📉 Short P&L Breakdown")
 c1, c2, c3, c4 = st.columns(4)
 with c1:
@@ -111,7 +159,6 @@ if st.button("Run P&L Breakdown"):
         m2.metric("Legs Count", f"{data.get('legs_count', 0)}")
         m3.metric("Rows Scanned", f"{data.get('rows_scanned', 0)}" if "rows_scanned" in data else "-")
 
-        # Legs table
         legs = data.get("legs", [])
         if legs:
             st.caption("Legs")
@@ -126,7 +173,7 @@ if st.button("Run P&L Breakdown"):
 
 section_divider()
 
-# Short P&L (aggregate)
+# ====================== SHORT P&L (AGGREGATE) ======================
 st.subheader("💰 Short P&L (Aggregate)")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -163,7 +210,7 @@ if st.button("Run Short P&L Aggregate"):
 
 section_divider()
 
-# Fees
+# ====================== FEES ======================
 st.subheader("🧾 Fees")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -187,12 +234,9 @@ if st.button("Run Fees"):
         totals = data.get("totals", {})
         by_col = totals.get("by_column", {})
         m1, m2, m3 = st.columns(3)
-        m1.metric("Txn Fees (sum)",
-                  f"{totals.get('by_column_sum', 0):,.2f}")
-        m2.metric("Borrow Fees",
-                  f"{totals.get('borrow_fees', 0):,.2f}")
-        m3.metric("Overnight Fees",
-                  f"{totals.get('overnight_fees', 0):,.2f}")
+        m1.metric("Txn Fees (sum)", f"{totals.get('by_column_sum', 0):,.2f}")
+        m2.metric("Borrow Fees",   f"{totals.get('borrow_fees', 0):,.2f}")
+        m3.metric("Overnight Fees",f"{totals.get('overnight_fees', 0):,.2f}")
 
         st.metric("Grand Total (all-in)", f"{totals.get('grand_total_all_in', 0):,.2f}")
 
@@ -201,7 +245,6 @@ if st.button("Run Fees"):
 
         by_symbol = data.get("by_symbol", {})
         if by_symbol:
-            # convert dict to list of rows
             rows = [{"symbol": k, **v} for k, v in by_symbol.items()]
             st.caption("By Symbol")
             st.dataframe(rows, use_container_width=True)
@@ -212,6 +255,8 @@ if st.button("Run Fees"):
         st.error(f"Fees error: {e}")
 
 section_divider()
+
+# ====================== VECTOR SEARCH (RAW) ======================
 st.subheader("🔎 Vector Search (any namespace)")
 
 qcol1, qcol2 = st.columns([3,1])
@@ -231,7 +276,6 @@ if st.button("Run Search"):
         st.success("Search complete.")
         hits = data.get("hits", [])
         st.write(f"Results: {len(hits)}")
-        # Show the metadata for inspection
         rows = [h.get("metadata", {}) for h in hits]
         if rows:
             st.dataframe(rows, use_container_width=True)
@@ -239,48 +283,3 @@ if st.button("Run Search"):
             st.code(json.dumps(data, indent=2))
     except Exception as e:
         st.error(f"Search error: {e}")
-
-# -------------------- Q&A over the vector index --------------------
-st.markdown("---")
-st.subheader("🗣️ Ask the Library (with citations)")
-
-qa_query    = st.text_input("Your question", value="What does Marcus Aurelius say about forgiveness?")
-qa_topk     = st.number_input("Top K (chunks to use)", min_value=4, max_value=50, value=12, step=1, key="qa_topk")
-qa_minscore = st.slider("Minimum vector score (optional)", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
-
-if st.button("Answer with citations"):
-    try:
-        # Build the body expected by POST /answer
-        body = {
-            "query": qa_query,
-            "namespace": namespace,   # comes from the sidebar input you already have
-            "top_k": int(qa_topk),
-            "min_score": float(qa_minscore) if qa_minscore > 0 else None
-        }
-
-        data = post_json(f"{base_url}/answer", auth_headers(token), body)
-        st.success("Answer generated.")
-
-        # Render the answer
-        st.markdown("### Answer")
-        st.markdown(data.get("answer", "_no answer_"))
-
-        # Citations (small table)
-        cits = data.get("citations", [])
-        if cits:
-            st.markdown("#### Citations")
-            # expecting items like {"n": 1, "hash": "...", "source": "..."}
-            st.table(cits)
-
-        # Supporting snippets (full text)
-        snips = data.get("snippets", [])
-        if snips:
-            st.markdown("#### Supporting snippets")
-            # typically: {"hash","source","namespace","text"}
-            st.dataframe(snips, use_container_width=True)
-
-        with st.expander("Raw JSON"):
-            st.code(json.dumps(data, indent=2))
-
-    except Exception as e:
-        st.error(f"Answer error: {e}")
