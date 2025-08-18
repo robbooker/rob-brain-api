@@ -47,8 +47,21 @@ def openapi_nonfiction():
     full = app.openapi()
 
     # Keep only these paths
-    allowed = {"/healthz", "/search", "/answer"}
+   @app.get("/openapi_nonfiction.json")
+    def openapi_nonfiction():
+    full = app.openapi()
+    # include /chat so the GPT can call the stateful endpoint
+    allowed = {"/healthz", "/search", "/answer", "/chat"}
     minimal_paths = {p: spec for p, spec in full.get("paths", {}).items() if p in allowed}
+
+    minimal = dict(full)
+    minimal["paths"] = minimal_paths
+    info = dict(minimal.get("info", {}))
+    info["title"] = (info.get("title") or "API") + " — Nonfiction GPT Spec"
+    # (optional) surface the model hint you added earlier
+    info["x-answer-model"] = "gpt-4.1"
+    minimal["info"] = info
+    return JSONResponse(minimal)
 
     # Build a trimmed schema
     minimal = dict(full)  # shallow copy is fine
