@@ -42,7 +42,7 @@ app = FastAPI(title="Rob Forever Brain API", version="2.2.6")
 from fastapi.responses import JSONResponse
 
 @app.get("/openapi_nonfiction.json")
-def openapi_nonfiction():
+    def openapi_nonfiction():
     # Start from the full schema that FastAPI already generates
     full = app.openapi()
 
