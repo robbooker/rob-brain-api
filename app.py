@@ -11,6 +11,11 @@ from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # ==== OpenAI embeddings ====
+import logging
+logger = logging.getLogger("uvicorn.error")
+logger.info("ANSWER: OPENAI key present? %s", bool(os.getenv("OPENAI_API_KEY")))
+logger.info("ANSWER: model=%s", os.getenv("ANSWER_MODEL", "gpt-4o-mini"))
+
 from openai import OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
