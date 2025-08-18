@@ -77,7 +77,7 @@ def custom_openapi():
         routes=app.routes,
     )
     schema["servers"] = [
-        {"url": "https://rob-brain-api.onrender.com", "description": "prod"}
+        {"url": "https://rob-brain-api-1.onrender.com", "description": "prod"}
     ]
     app.openapi_schema = schema
     return app.openapi_schema
