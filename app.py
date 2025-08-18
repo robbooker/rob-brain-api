@@ -57,6 +57,7 @@ def openapi_nonfiction():
     # (Optional) make it clear in the title/version this is the slim spec used by GPT
     info = dict(minimal.get("info", {}))
     info["title"] = (info.get("title") or "API") + " — Nonfiction GPT Spec"
+    info["x-answer-model"] = "gpt-4.1"   # 👈 tell GPT which model to use
     minimal["info"] = info
 
     return JSONResponse(minimal)
