@@ -42,40 +42,26 @@ app = FastAPI(title="Rob Forever Brain API", version="2.2.6")
 from fastapi.responses import JSONResponse
 
 @app.get("/openapi_nonfiction.json")
-    def openapi_nonfiction():
+def openapi_nonfiction():
     # Start from the full schema that FastAPI already generates
     full = app.openapi()
 
     # Keep only these paths
-   @app.get("/openapi_nonfiction.json")
-    def openapi_nonfiction():
-    full = app.openapi()
-    # include /chat so the GPT can call the stateful endpoint
     allowed = {"/healthz", "/search", "/answer", "/chat"}
     minimal_paths = {p: spec for p, spec in full.get("paths", {}).items() if p in allowed}
-
-    minimal = dict(full)
-    minimal["paths"] = minimal_paths
-    info = dict(minimal.get("info", {}))
-    info["title"] = (info.get("title") or "API") + " — Nonfiction GPT Spec"
-    # (optional) surface the model hint you added earlier
-    info["x-answer-model"] = "gpt-4.1"
-    minimal["info"] = info
-    return JSONResponse(minimal)
 
     # Build a trimmed schema
     minimal = dict(full)  # shallow copy is fine
     minimal["paths"] = minimal_paths
 
-    # (Optional) make it clear in the title/version this is the slim spec used by GPT
+    # Add model hint for GPT
     info = dict(minimal.get("info", {}))
     info["title"] = (info.get("title") or "API") + " — Nonfiction GPT Spec"
-    info["x-answer-model"] = "gpt-4.1"   # 👈 tell GPT which model to use
+    info["x-answer-model"] = "gpt-4.1"
     minimal["info"] = info
 
     return JSONResponse(minimal)
-
-# --- END Minimal OpenAPI for the GPT (nonfiction-only tools) ---
+# --- END Minimal OpenAPI for the GPT ---
 
 app.add_middleware(
     CORSMiddleware,
