@@ -33,6 +33,31 @@ index = pc.Index(INDEX_NAME)
 # ==== FastAPI ====
 app = FastAPI(title="Rob Forever Brain API", version="2.2.6")
 
+# --- Minimal OpenAPI for the GPT (nonfiction-only tools) ---
+from fastapi.responses import JSONResponse
+
+@app.get("/openapi_nonfiction.json")
+def openapi_nonfiction():
+    # Start from the full schema that FastAPI already generates
+    full = app.openapi()
+
+    # Keep only these paths
+    allowed = {"/healthz", "/search", "/answer"}
+    minimal_paths = {p: spec for p, spec in full.get("paths", {}).items() if p in allowed}
+
+    # Build a trimmed schema
+    minimal = dict(full)  # shallow copy is fine
+    minimal["paths"] = minimal_paths
+
+    # (Optional) make it clear in the title/version this is the slim spec used by GPT
+    info = dict(minimal.get("info", {}))
+    info["title"] = (info.get("title") or "API") + " — Nonfiction GPT Spec"
+    minimal["info"] = info
+
+    return JSONResponse(minimal)
+
+# --- END Minimal OpenAPI for the GPT (nonfiction-only tools) ---
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
