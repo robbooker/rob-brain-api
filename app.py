@@ -1429,3 +1429,158 @@ Context:
         "used_top_k": len(snippets),
         "namespace": effective_namespace
     }
+
+# ==== /chat (conversational RAG with light history) ====
+
+from typing import Literal
+
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+class ChatBody(BaseModel):
+    query: str
+    history: List[ChatTurn] = []          # recent turns the GPT will send back
+    namespace: str = "nonfiction"         # "all" to fan out
+    top_k: int = 12
+    min_score: Optional[float] = None
+
+@app.post("/chat", summary="Conversational answer")
+def chat(body: ChatBody, authorization: Optional[str] = Header(default=None)):
+    """
+    Conversational RAG:
+      - Accepts short chat history so answers can reference prior turns.
+      - Same vector search + citations as /answer.
+      - Returns suggested follow-ups for a chatty UX.
+    """
+    _check_bearer(authorization)
+
+    # ----- 1) Vector search (single or multi-namespace) -----
+    ns_raw = (body.namespace or "").lower()
+    if ns_raw in ("all", "*", ""):
+        namespaces = ["nonfiction", "trading", "short-selling"]
+        hits = _vector_search_multi(
+            query=body.query,
+            namespaces=namespaces,
+            top_k=body.top_k,
+            min_score=body.min_score
+        )
+        effective_namespace = "all"
+    else:
+        hits = _vector_search_simple(
+            query=body.query,
+            namespace=body.namespace,
+            top_k=body.top_k,
+            min_score=body.min_score
+        )
+        effective_namespace = body.namespace
+
+    # ----- 2) Build snippets + context blocks -----
+    snippets: List[Dict[str, Any]] = []
+    for h in hits:
+        md = h.get("metadata", {}) or {}
+        ns = h.get("namespace") or md.get("namespace") or effective_namespace
+        snippets.append({
+            "hash": md.get("uid") or md.get("hash") or h.get("id"),
+            "source": md.get("source") or md.get("file") or md.get("symbol") or md.get("title") or "",
+            "namespace": ns,
+            "title": md.get("title") or md.get("symbol") or md.get("file") or "",
+            "text": md.get("text") or md.get("description") or md.get("content") or "",
+            "score": float(h.get("score", 0.0) or 0.0),
+        })
+
+    if not snippets:
+        return {
+            "answer": "I couldn’t find anything relevant in the vector index for that question.",
+            "citations": [],
+            "snippets": [],
+            "used_top_k": 0,
+            "namespace": effective_namespace,
+            "followups": [
+                "Try a different phrasing?",
+                "Search a specific source or author?",
+                "Lower the minimum score filter?"
+            ]
+        }
+
+    blocks = []
+    for i, s in enumerate(snippets, start=1):
+        txt = (s["text"] or "").strip()
+        if not txt:
+            continue
+        blocks.append(f"[{i}] {txt}\n(source={s['source']}, ns={s['namespace']}, hash={s['hash']})")
+    context = "\n\n".join(blocks)
+
+    # ----- 3) Lightly compress recent history (last 6 turns, up to ~2k chars) -----
+    recent = body.history[-6:] if body.history else []
+    hist_lines = [f"{t.role.upper()}: {t.content.strip()}" for t in recent if (t.content or "").strip()]
+    history_blob = "\n".join(hist_lines)
+    if len(history_blob) > 2000:
+        history_blob = history_blob[-2000:]  # keep tail
+
+    # ----- 4) Synthesize with model (falls back if no key / error) -----
+    if not os.getenv("OPENAI_API_KEY"):
+        return {
+            "answer": "(debug) No OPENAI_API_KEY set — returning snippets only.",
+            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
+            "snippets": snippets,
+            "used_top_k": len(snippets),
+            "namespace": effective_namespace,
+            "followups": ["Want me to search a different namespace?", "Should I find original passages?"]
+        }
+
+    try:
+        model = os.getenv("ANSWER_MODEL", "gpt-4.1")
+        system_msg = (
+            "You are a concise research assistant. Use ONLY the provided context blocks.\n"
+            "Cite with [1], [2], etc. If something is not supported by the context, say so."
+        )
+        user_prompt = f"""
+Prior conversation (most recent last):
+{history_blob or "(no prior turns)"}
+
+User question:
+{body.query}
+
+Use the context below to answer and include inline numeric citations:
+
+Context:
+{context}
+"""
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        answer_text = resp.choices[0].message.content
+    except Exception as e:
+        return {
+            "answer": f"(debug) Model call failed: {e}. Returning snippets only.",
+            "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
+            "snippets": snippets,
+            "used_top_k": len(snippets),
+            "namespace": effective_namespace,
+            "followups": ["Try a shorter question?", "Narrow to one namespace?"]
+        }
+
+    # simple follow-up suggestions based on the question words
+    q = (body.query or "").lower()
+    followups = []
+    if "marcus" in q or "meditations" in q:
+        followups = ["Show me the exact passage?", "What does he say about anger?", "Any related notes from later books?"]
+    elif "short" in q or "borrow" in q or "fees" in q:
+        followups = ["Break it down by symbol?", "Show daily totals?", "Compare across months?"]
+    else:
+        followups = ["Want me to pull more sources?", "Search another namespace?", "Should I broaden the time period?"]
+
+    return {
+        "answer": answer_text,
+        "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
+        "snippets": snippets,
+        "used_top_k": len(snippets),
+        "namespace": effective_namespace,
+        "followups": followups
+    }
