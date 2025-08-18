@@ -1386,7 +1386,7 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
 
     # 4) Call OpenAI to synthesize an answer with inline citations
     try:
-        model = os.getenv("ANSWER_MODEL", "gpt-4o-mini")
+        model = os.getenv("ANSWER_MODEL", "gpt-4o")
         prompt = f"""Answer the question using ONLY the context. If something is not in the context, say you can't find it.
 Cite sources inline using square-bracket numbers like [1], [2] that refer to the context blocks below.
 
