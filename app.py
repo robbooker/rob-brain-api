@@ -1284,6 +1284,7 @@ def shorts_over_price(
 
 from pydantic import BaseModel
 from fastapi import HTTPException, Header
+import traceback
 
 class AnswerBody(BaseModel):
     query: str
@@ -1292,10 +1293,6 @@ class AnswerBody(BaseModel):
     min_score: Optional[float] = None
 
 def _vector_search_simple(query: str, namespace: str, top_k: int, min_score: Optional[float]) -> List[Dict[str, Any]]:
-    """
-    Runs an embedding search against a single namespace and returns
-    a list of hits with normalized fields: score, metadata, id.
-    """
     vec = embed_query(query)
     try:
         res = index.query(vector=vec, top_k=top_k, namespace=namespace, include_metadata=True)
@@ -1317,10 +1314,6 @@ def _vector_search_simple(query: str, namespace: str, top_k: int, min_score: Opt
     return hits
 
 def _vector_search_multi(query: str, namespaces: List[str], top_k: int, min_score: Optional[float]) -> List[Dict[str, Any]]:
-    """
-    Run vector search across multiple namespaces and merge results.
-    Returns a list of hits with: namespace, score, id, metadata.
-    """
     vec = embed_query(query)
     merged: List[Dict[str, Any]] = []
     for ns in namespaces:
@@ -1338,41 +1331,24 @@ def _vector_search_multi(query: str, namespaces: List[str], top_k: int, min_scor
                     "metadata": getattr(m, "metadata", {}) or {},
                 })
         except Exception as e:
-            # non-fatal; record the error as a stub so we can see which ns failed
             merged.append({"namespace": ns, "score": 0.0, "id": None, "metadata": {"error": str(e)}})
     return merged
 
 @app.post("/answer", summary="Answer")
 def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)):
-    """
-    Synthesizes a short answer from vector search results in the requested namespace.
-    - If namespace == 'all' (or '*' or ''), fans out across ['nonfiction','trading','short-selling'].
-    - If OPENAI_API_KEY is missing or model call fails, returns a debug payload with snippets & citations.
-    - Citations appear as [1], [2], ... based on snippet order.
-    """
     _check_bearer(authorization)
 
-    # 1) Vector search (single ns or multi-ns)
+    # 1) Vector search
     ns_raw = (body.namespace or "").lower()
     if ns_raw in ("all", "*", ""):
         namespaces = ["nonfiction", "trading", "short-selling"]
-        hits = _vector_search_multi(
-            query=body.query,
-            namespaces=namespaces,
-            top_k=body.top_k,
-            min_score=body.min_score
-        )
+        hits = _vector_search_multi(body.query, namespaces, body.top_k, body.min_score)
         effective_namespace = "all"
     else:
-        hits = _vector_search_simple(
-            query=body.query,
-            namespace=body.namespace,
-            top_k=body.top_k,
-            min_score=body.min_score
-        )
+        hits = _vector_search_simple(body.query, body.namespace, body.top_k, body.min_score)
         effective_namespace = body.namespace
 
-    # 2) Build snippets and numbered context
+    # 2) Build snippets
     snippets: List[Dict[str, Any]] = []
     for h in hits:
         md = h.get("metadata", {}) or {}
@@ -1400,11 +1376,10 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
         txt = (s["text"] or "").strip()
         if not txt:
             continue
-        # include namespace for clarity in merged results
         blocks.append(f"[{i}] {txt}\n(source={s['source']}, ns={s['namespace']}, hash={s['hash']})")
     context = "\n\n".join(blocks)
 
-    # 3) If no OpenAI key, return debug (no model call)
+    # 3) If no OpenAI key
     if not os.getenv("OPENAI_API_KEY"):
         return {
             "answer": "(debug) No OPENAI_API_KEY set on the backend — returning snippets only.",
@@ -1414,11 +1389,12 @@ def answer(body: AnswerBody, authorization: Optional[str] = Header(default=None)
             "namespace": effective_namespace
         }
 
-    # 4) Call OpenAI to synthesize an answer with inline citations
+    # 4) Call OpenAI with safety net
     try:
-        model = os.getenv("ANSWER_MODEL", "gpt-4o")
-        prompt = f"""Answer the question using ONLY the context. If something is not in the context, say you can't find it.
-Cite sources inline using square-bracket numbers like [1], [2] that refer to the context blocks below.
+        model = os.getenv("ANSWER_MODEL", "gpt-4.1")  # latest stable default
+        prompt = f"""Answer the question using ONLY the context. 
+If something is not in the context, say you can't find it.
+Cite sources inline with [1], [2], ... matching the context below.
 
 Question: {body.query}
 
@@ -1435,7 +1411,8 @@ Context:
         )
         answer_text = resp.choices[0].message.content
     except Exception as e:
-        # Graceful fallback if the model call fails
+        tb = traceback.format_exc()
+        logger.error(f"ANSWER: OpenAI call failed: {e}\n{tb}")
         return {
             "answer": f"(debug) Model call failed: {e}. Returning snippets only.",
             "citations": [{"n": i+1, "hash": s["hash"], "source": s["source"], "namespace": s["namespace"]} for i, s in enumerate(snippets)],
